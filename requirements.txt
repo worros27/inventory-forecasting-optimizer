@@ -1,0 +1,2391 @@
+import pandas as pd
+import numpy as np
+import sys
+import warnings
+import re
+import glob
+import os
+import argparse
+from pathlib import Path
+from sklearn.ensemble import (
+    RandomForestRegressor, RandomForestClassifier,
+    ExtraTreesRegressor, ExtraTreesClassifier,
+    HistGradientBoostingRegressor, HistGradientBoostingClassifier
+)
+from sklearn.metrics import mean_absolute_error
+
+warnings.filterwarnings("ignore")
+np.random.seed(42)
+
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+
+# ==========================================
+# CONFIG
+# ==========================================
+VERSION_TAG = "portfolio_forecast_weekly_aggressive"
+
+# ==========================================
+# PORTFOLIO-SAFE PATH CONFIG
+# ==========================================
+# This public/demo version intentionally uses relative paths and synthetic/sample inputs.
+# Do not commit real company files, customer names, sales history, purchase orders, or private paths.
+PROJECT_ROOT = Path(__file__).resolve().parent
+DATA_DIR = Path(os.getenv("DATA_DIR", PROJECT_ROOT / "sample_data"))
+OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", PROJECT_ROOT / "outputs"))
+
+# Required input. Expected columns by default:
+# Part_Number, Date, Quantity, Customer, Segment
+FILE_PATH = os.getenv("INPUT_FILE", str(DATA_DIR / "sales_history_sample.csv"))
+
+# Optional target SKU list. If missing, SAMPLE_TARGET_SKUS below is used.
+# Accepted formats: CSV/XLSX with a sku_id, SKU, Part_Number, or first column.
+TARGET_SKU_FILE = os.getenv("TARGET_SKU_FILE", str(DATA_DIR / "target_skus_sample.csv"))
+
+# Optional marketplace/retail forward-signal files. These are disabled by default
+# for GitHub safety. Enable only with synthetic or approved data.
+MARKETPLACE_DIR = Path(os.getenv("MARKETPLACE_DIR", DATA_DIR))
+MARKETPLACE_MAPPING_FILE_PATTERN = str(MARKETPLACE_DIR / "marketplace_product_mapping*.xlsx")
+MARKETPLACE_INVENTORY_FILE_PATTERN = str(MARKETPLACE_DIR / "marketplace_inventory*.csv")
+MARKETPLACE_FORECAST_FILE_PATTERN = str(MARKETPLACE_DIR / "marketplace_forecast*.csv")
+MARKETPLACE_SHARE_OF_BUSINESS_FILE_PATTERN = str(MARKETPLACE_DIR / "marketplace_share_of_business*.xlsx")
+
+# Backward-compatible internal variable names used by the modeling layer.
+AMZ_MAPPING_FILE_PATTERN = MARKETPLACE_MAPPING_FILE_PATTERN
+VENDOR_INVENTORY_FILE_PATTERN = MARKETPLACE_INVENTORY_FILE_PATTERN
+VENDOR_FORECAST_FILE_PATTERN = MARKETPLACE_FORECAST_FILE_PATTERN
+AMZ_SHARE_OF_BUSINESS_FILE_PATTERN = MARKETPLACE_SHARE_OF_BUSINESS_FILE_PATTERN
+
+# Marketplace forward signal is intentionally light. It supplements internal marketplace cycle features;
+# it does not replace the non-marketplace forecast target.
+USE_VENDOR_FORWARD_SIGNAL = os.getenv("USE_VENDOR_FORWARD_SIGNAL", "0").strip().lower() in {"1", "true", "yes", "y"}
+VENDOR_FORWARD_MAX_UPLIFT = 0.05
+VENDOR_FORWARD_MAX_DOWNLIFT = -0.03
+VENDOR_MIN_RELIABILITY_TO_ADJUST = 0.15
+
+# Forecast setting:
+# - cutoff date is auto-detected from the latest Date in the input CSV
+# - forecast period is the next 3.5 months after that cutoff
+# - 3.5 months is converted to days automatically using average calendar month length
+FORECAST_MONTHS = 3.5
+FORECAST_DAYS_PER_MONTH = 365.25 / 12
+
+TRAIN_START_DATE = "2021-01-01"
+TRAIN_END_DATE = None
+PRODUCTION_CUTOFF = None
+FORECAST_START_DATE = None
+FORECAST_END_DATE = None
+FORECAST_HORIZON_DAYS = None
+UPLIFT_HOLDOUT_START = None
+PRODUCTION_OUTPUT_PATH = None
+
+# Legacy validation/report paths are intentionally disabled in this one-file production version.
+VALIDATION_OUTPUT_PATH = None
+MANUAL_OUTPUT_PATH = None
+FEATURE_DIAGNOSTIC_OUTPUT_PATH = None
+SKU_VALIDATION_SUMMARY_OUTPUT_PATH = None
+
+ROLLING_FREQ_DAYS = int(os.getenv("ROLLING_FREQ_DAYS", "60"))
+MIN_HISTORY_DAYS = 180
+MIN_FORECAST_THRESHOLD = 5.0
+
+# OOS proxy tuning for Top 50 SKUs.
+OOS_MIN_ZERO_GAP_DAYS = 10.0
+OOS_MAX_ZERO_GAP_DAYS = 45.0
+OOS_ADI_MULTIPLIER = 2.5
+STRONG_OOS_PROXY_SCORE = 0.55
+SOFT_OOS_PROXY_SCORE = 0.30
+MAX_STANDARD_UPLIFT = 1.18
+MAX_STRONG_OOS_UPLIFT = 1.30
+MAX_GENERAL_CAP = 1.75
+
+# V36 demand reconstruction tuning.
+OOS_IMPUTE_LOOKBACK_DAYS = 365
+OOS_IMPUTE_RECENT_DAYS = 180
+OOS_IMPUTE_MAX_DAILY_MULTIPLIER = 1.25
+OOS_IMPUTE_MAX_RATIO_OF_RECENT_180 = 0.45
+CUSTOMER_LAYER_LOOKBACK_DAYS = 365
+CUSTOMER_LAYER_TOP_N = 3
+CUSTOMER_LAYER_MAX_BLEND = 0.45
+REPEATABLE_SPIKE_MIN_COUNT = 2
+
+RAW_TARGET_SKUS = [
+    # Synthetic placeholder SKUs for the public portfolio version.
+    # For real/private use, provide --target-sku-file or set TARGET_SKU_FILE.
+    "SKU001", "SKU002", "SKU003", "SKU004", "SKU005",
+    "SKU006", "SKU007", "SKU008", "SKU009", "SKU010",
+    "SKU011", "SKU012", "SKU013", "SKU014", "SKU015",
+    "SKU016", "SKU017", "SKU018", "SKU019", "SKU020",
+]
+
+
+# ==========================================
+# AUTO DATE / OUTPUT HELPERS
+# ==========================================
+def format_forecast_period_label():
+    """Return a file/column-safe forecast period label, e.g. 3_5_Months."""
+    if float(FORECAST_MONTHS).is_integer():
+        return f"{int(FORECAST_MONTHS)}_Months"
+    return str(FORECAST_MONTHS).replace(".", "_") + "_Months"
+
+
+def compute_auto_forecast_settings(raw_all_positive_dates):
+    """
+    Automatically set production cutoff and forecast horizon from the newest date in the source file.
+    Forecast period = next 3.5 months after the cutoff.
+    """
+    global TRAIN_END_DATE, PRODUCTION_CUTOFF, FORECAST_START_DATE, FORECAST_END_DATE
+    global FORECAST_HORIZON_DAYS, UPLIFT_HOLDOUT_START, PRODUCTION_OUTPUT_PATH
+
+    latest_date = pd.to_datetime(raw_all_positive_dates.max()).normalize()
+    if pd.isna(latest_date):
+        raise ValueError("Cannot detect latest date from source data.")
+
+    forecast_start = latest_date + pd.Timedelta(days=1)
+    horizon_days = int(round(FORECAST_MONTHS * FORECAST_DAYS_PER_MONTH))
+    forecast_end = latest_date + pd.Timedelta(days=horizon_days)
+
+    TRAIN_END_DATE = latest_date.strftime("%Y-%m-%d")
+    PRODUCTION_CUTOFF = latest_date.strftime("%Y-%m-%d")
+    FORECAST_START_DATE = forecast_start.strftime("%Y-%m-%d")
+    FORECAST_END_DATE = forecast_end.strftime("%Y-%m-%d")
+    FORECAST_HORIZON_DAYS = horizon_days
+
+    # Training rows need a completed future horizon.
+    # Use the latest available completed forecast window as holdout, but keep it automatic.
+    latest_completed_training_cutoff = latest_date - pd.Timedelta(days=horizon_days)
+    holdout_start = latest_completed_training_cutoff - pd.Timedelta(days=max(180, horizon_days))
+    min_holdout_start = pd.to_datetime(TRAIN_START_DATE) + pd.Timedelta(days=MIN_HISTORY_DAYS + horizon_days)
+    holdout_start = max(holdout_start, min_holdout_start)
+    UPLIFT_HOLDOUT_START = holdout_start.strftime("%Y-%m-%d")
+
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    PRODUCTION_OUTPUT_PATH = str(
+        OUTPUT_DIR / f"forecast_next_{format_forecast_period_label()}_{VERSION_TAG}_cutoff_{PRODUCTION_CUTOFF}.csv"
+    )
+
+    return {
+        "production_cutoff": PRODUCTION_CUTOFF,
+        "forecast_start": FORECAST_START_DATE,
+        "forecast_end": FORECAST_END_DATE,
+        "forecast_horizon_days": FORECAST_HORIZON_DAYS,
+        "uplift_holdout_start": UPLIFT_HOLDOUT_START,
+        "production_output_path": PRODUCTION_OUTPUT_PATH,
+    }
+
+
+# ==========================================
+# HELPERS
+# ==========================================
+def normalize_sku(x):
+    s = str(x).strip().upper()
+    return s.zfill(5) if s.isdigit() else s
+
+
+def unique_target_skus(raw_skus=None):
+    """Return normalized target SKUs once, preserving the target list order.
+
+    This prevents duplicate entries such as 45012 from creating unstable sort-order maps
+    and makes the output easier to audit.
+    """
+    if raw_skus is None:
+        raw_skus = RAW_TARGET_SKUS
+    seen = set()
+    ordered = []
+    for x in raw_skus:
+        sku = normalize_sku(x)
+        if sku not in seen:
+            seen.add(sku)
+            ordered.append(sku)
+    return ordered
+
+
+def safe_div(a, b, default=0.0):
+    return a / b if b not in [0, 0.0, None] else default
+
+
+def calc_hhi(df):
+    customer_vol = df.groupby("customer")["sales"].sum()
+    total = customer_vol.sum()
+    if total <= 0:
+        return 0.0
+    return float(((customer_vol / total) ** 2).sum() * 10000)
+
+
+def predict_prob_positive(model, X):
+    if hasattr(model, "classes_"):
+        classes = list(model.classes_)
+        if len(classes) == 2:
+            return model.predict_proba(X)[:, classes.index(1) if 1 in classes else 1]
+        elif len(classes) == 1:
+            return np.ones(len(X)) if classes[0] == 1 else np.zeros(len(X))
+    return np.zeros(len(X))
+
+
+def wape(actual, pred):
+    actual = np.asarray(actual, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    return np.sum(np.abs(actual - pred)) / max(np.sum(np.abs(actual)), 1.0)
+
+
+def bias_pct(actual, pred):
+    actual = np.asarray(actual, dtype=float)
+    pred = np.asarray(pred, dtype=float)
+    return np.sum(pred - actual) / max(np.sum(np.abs(actual)), 1.0)
+
+
+# ==========================================
+# AMZ SIGNAL HELPERS
+# ==========================================
+def is_amz_customer_series(customer_series):
+    """Identify marketplace rows from customer name."""
+    return customer_series.astype(str).str.contains("AMAZON|AMZ", case=False, na=False)
+
+
+def split_amz_non_amz(raw):
+    """Create all-sales signal data and non-marketplace target data from the same cleaned raw table."""
+    amz_mask = is_amz_customer_series(raw["customer"])
+    raw_all = raw.copy()
+    raw_amz = raw.loc[amz_mask].copy()
+    raw_non_amz = raw.loc[~amz_mask].copy()
+    return raw_all, raw_amz, raw_non_amz
+
+
+def calc_amz_signal_features(sku_past_all, cutoff):
+    """
+    AMZ is used only as a supporting signal.
+    The prediction target remains non-marketplace demand.
+    """
+    default = {
+        "amz_recent_30_sales": 0.0,
+        "amz_recent_60_sales": 0.0,
+        "amz_recent_90_sales": 0.0,
+        "amz_recent_180_sales": 0.0,
+        "total_recent_30_sales": 0.0,
+        "total_recent_60_sales": 0.0,
+        "total_recent_90_sales": 0.0,
+        "total_recent_180_sales": 0.0,
+        "non_amz_recent_30_sales_check": 0.0,
+        "non_amz_recent_60_sales_check": 0.0,
+        "non_amz_recent_90_sales_check": 0.0,
+        "non_amz_recent_180_sales_check": 0.0,
+        "amz_share_recent_30": 0.0,
+        "amz_share_recent_60": 0.0,
+        "amz_share_recent_90": 0.0,
+        "amz_share_recent_180": 0.0,
+        "non_amz_share_recent_180": 1.0,
+        "amz_momentum_30_90": 1.0,
+        "amz_days_since_last_order": 999,
+        "amz_spike_count_180": 0,
+        "amz_present_flag": 0,
+
+        # AMZ replenishment-cycle / interval features.
+        "amz_order_count_all": 0,
+        "amz_order_count_180": 0,
+        "amz_avg_order_size_all": 0.0,
+        "amz_recent_avg_order_size": 0.0,
+        "amz_order_size_ratio": 1.0,
+        "amz_avg_interval_all": 999.0,
+        "amz_median_interval_all": 999.0,
+        "amz_recent_median_interval": 999.0,
+        "amz_interval_ratio": 1.0,
+        "amz_due_score": 0.0,
+        "amz_cycle_signal_strength": 0.0,
+        "amz_cycle_status": "NO_AMZ_HISTORY",
+    }
+    if sku_past_all is None or sku_past_all.empty:
+        return default
+
+    sku_past_all = sku_past_all.copy()
+    amz_mask = is_amz_customer_series(sku_past_all["customer"])
+    amz = sku_past_all.loc[amz_mask].copy()
+    non_amz = sku_past_all.loc[~amz_mask].copy()
+
+    def recent_sum(df, days):
+        if df.empty:
+            return 0.0
+        return float(df.loc[df["date"] >= cutoff - pd.Timedelta(days=days), "sales"].sum())
+
+    out = default.copy()
+    for d in [30, 60, 90, 180]:
+        total = recent_sum(sku_past_all, d)
+        amz_sales = recent_sum(amz, d)
+        non_amz_sales = recent_sum(non_amz, d)
+        out[f"total_recent_{d}_sales"] = total
+        out[f"amz_recent_{d}_sales"] = amz_sales
+        out[f"non_amz_recent_{d}_sales_check"] = non_amz_sales
+        out[f"amz_share_recent_{d}"] = float(amz_sales / max(total, 1.0))
+
+    out["non_amz_share_recent_180"] = float(out["non_amz_recent_180_sales_check"] / max(out["total_recent_180_sales"], 1.0))
+    out["amz_present_flag"] = 1 if len(amz) > 0 and amz["sales"].sum() > 0 else 0
+    out["amz_days_since_last_order"] = int((cutoff - amz["date"].max()).days) if not amz.empty else 999
+
+    amz_30_rate = out["amz_recent_30_sales"] / 30.0
+    amz_prev_60_rate = max((out["amz_recent_90_sales"] - out["amz_recent_30_sales"]) / 60.0, 0.01)
+    out["amz_momentum_30_90"] = float(amz_30_rate / amz_prev_60_rate)
+
+    if not amz.empty:
+        amz_daily = amz.groupby("date", as_index=False)["sales"].sum().sort_values("date")
+        amz_daily_180 = amz_daily[amz_daily["date"] >= cutoff - pd.Timedelta(days=180)].copy()
+        non_zero = amz_daily.loc[amz_daily["sales"] > 0, "sales"]
+        if len(non_zero) >= 3 and not amz_daily_180.empty:
+            threshold = max(10.0, float(np.percentile(non_zero, 90)), float(non_zero.median()) * 2.0)
+            out["amz_spike_count_180"] = int((amz_daily_180["sales"] >= threshold).sum())
+
+        # AMZ replenishment-cycle logic.
+        # AMZ often buys as intermittent large replenishment POs, so interval changes matter more
+        # than simple short-window sales totals. All values are calculated only from history before cutoff.
+        amz_order_days = amz_daily.loc[amz_daily["sales"] > 0].copy()
+        out["amz_order_count_all"] = int(len(amz_order_days))
+        out["amz_order_count_180"] = int((amz_order_days["date"] >= cutoff - pd.Timedelta(days=180)).sum())
+
+        if len(amz_order_days) > 0:
+            out["amz_avg_order_size_all"] = float(amz_order_days["sales"].mean())
+            recent_order_sizes = amz_order_days.tail(3)["sales"]
+            out["amz_recent_avg_order_size"] = float(recent_order_sizes.mean())
+            out["amz_order_size_ratio"] = float(out["amz_recent_avg_order_size"] / max(out["amz_avg_order_size_all"], 1.0))
+
+        if len(amz_order_days) >= 2:
+            intervals = amz_order_days["date"].diff().dt.days.dropna()
+            if not intervals.empty:
+                out["amz_avg_interval_all"] = float(intervals.mean())
+                out["amz_median_interval_all"] = float(intervals.median())
+
+                recent_intervals = intervals.tail(4)
+                out["amz_recent_median_interval"] = float(recent_intervals.median())
+                out["amz_interval_ratio"] = float(out["amz_recent_median_interval"] / max(out["amz_median_interval_all"], 1.0))
+                out["amz_due_score"] = float(out["amz_days_since_last_order"] / max(out["amz_median_interval_all"], 1.0))
+
+        # Cycle status: compact categorical feature for the ML layer and final output.
+        order_count_180 = out["amz_order_count_180"]
+        interval_ratio = out["amz_interval_ratio"]
+        due_score = out["amz_due_score"]
+        order_size_ratio = out["amz_order_size_ratio"]
+
+        if out["amz_order_count_all"] < 2:
+            out["amz_cycle_status"] = "INSUFFICIENT_AMZ_HISTORY"
+            out["amz_cycle_signal_strength"] = 0.0
+        elif interval_ratio < 0.75 and order_count_180 >= 2:
+            out["amz_cycle_status"] = "AMZ_CYCLE_ACCELERATING"
+            out["amz_cycle_signal_strength"] = 0.80
+        elif 0.75 <= interval_ratio <= 1.25 and 0.75 <= due_score <= 1.35 and order_count_180 >= 1:
+            out["amz_cycle_status"] = "AMZ_NORMAL_REPLENISHMENT_WINDOW"
+            out["amz_cycle_signal_strength"] = 0.45
+        elif due_score > 2.0 and order_count_180 == 0:
+            out["amz_cycle_status"] = "AMZ_POSSIBLE_INACTIVE"
+            out["amz_cycle_signal_strength"] = -0.70
+        elif interval_ratio > 1.25 and due_score > 1.25:
+            out["amz_cycle_status"] = "AMZ_CYCLE_SLOWING_OR_DELAYED"
+            out["amz_cycle_signal_strength"] = -0.40
+        elif order_size_ratio >= 1.35 and order_count_180 >= 1:
+            out["amz_cycle_status"] = "AMZ_ORDER_SIZE_EXPANDING"
+            out["amz_cycle_signal_strength"] = 0.55
+        elif order_size_ratio <= 0.65 and order_count_180 >= 1:
+            out["amz_cycle_status"] = "AMZ_ORDER_SIZE_SHRINKING"
+            out["amz_cycle_signal_strength"] = -0.25
+        else:
+            out["amz_cycle_status"] = "AMZ_NEUTRAL"
+            out["amz_cycle_signal_strength"] = 0.0
+
+        # Keep extreme ratios bounded so the ML layer is not dominated by one AMZ replenishment anomaly.
+        out["amz_order_size_ratio"] = float(np.clip(out["amz_order_size_ratio"], 0.10, 5.00))
+        out["amz_interval_ratio"] = float(np.clip(out["amz_interval_ratio"], 0.10, 5.00))
+        out["amz_due_score"] = float(np.clip(out["amz_due_score"], 0.00, 5.00))
+
+    return out
+
+
+# ==========================================
+# VENDOR CENTRAL FORWARD-SIGNAL HELPERS
+# ==========================================
+def resolve_optional_file(path_or_pattern):
+    """
+    Resolve a local Windows path/pattern safely.
+
+    - Supports exact path and wildcard patterns.
+    - Ignores temporary Excel lock files like ~$xxx.xlsx.
+    - Selects the latest modified matching file.
+    - Falls back to /mnt/data by basename/pattern for ChatGPT sandbox testing.
+    - Returns None if no file is found, so marketplace portal signals remain optional.
+    """
+    if not path_or_pattern:
+        return None
+
+    raw_path = str(path_or_pattern)
+
+    def clean_matches(matches):
+        cleaned = []
+        for m in matches:
+            try:
+                p = Path(m)
+                if not p.exists() or p.name.startswith("~$"):
+                    continue
+                cleaned.append(str(p))
+            except Exception:
+                continue
+        return cleaned
+
+    # Direct exact path.
+    p = Path(raw_path)
+    if p.exists() and not p.name.startswith("~$"):
+        print(f"Resolved optional file: {p}")
+        return str(p)
+
+    # Glob on the provided path/pattern. Works on Windows for Windows paths.
+    matches = clean_matches(glob.glob(raw_path))
+    if matches:
+        latest = max(matches, key=lambda x: Path(x).stat().st_mtime)
+        print(f"Auto-selected latest file for pattern [{raw_path}]: {latest}")
+        return latest
+
+    # Sandbox fallback by exact basename. pathlib on Linux does not split Windows backslashes,
+    # so normalize separators manually.
+    base = raw_path.replace("\\", "/").split("/")[-1]
+    sandbox = Path("/mnt/data") / base
+    if sandbox.exists() and not sandbox.name.startswith("~$"):
+        print(f"Resolved optional file from sandbox: {sandbox}")
+        return str(sandbox)
+
+    # Sandbox fallback by wildcard basename.
+    if "*" in base:
+        sandbox_matches = clean_matches(glob.glob(str(Path("/mnt/data") / base)))
+        if sandbox_matches:
+            latest = max(sandbox_matches, key=lambda x: Path(x).stat().st_mtime)
+            print(f"Auto-selected latest sandbox file for pattern [{base}]: {latest}")
+            return latest
+
+    print(f"Optional file not found for path/pattern: {raw_path}")
+    return None
+
+def clean_number(x):
+    """Convert marketplace report values like '$1,234', '12.3%', '-', blanks to float."""
+    if pd.isna(x):
+        return 0.0
+    s = str(x).strip()
+    if s in ["", "-", "--", "nan", "None"]:
+        return 0.0
+    is_pct = s.endswith("%")
+    s = s.replace("$", "").replace(",", "").replace("%", "").strip()
+    try:
+        v = float(s)
+        return v / 100.0 if is_pct else v
+    except Exception:
+        return 0.0
+
+
+def normalize_vendor_sku(x):
+    """Normalize PN/QB REF/Product Title into the same sku_id format used in the forecast table."""
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().upper()
+    if not s or s in ["NAN", "NONE"]:
+        return ""
+
+    # QB REF often looks like 11.Acces:00016. Keep the part after the colon.
+    if ":" in s:
+        s = s.split(":")[-1].strip()
+
+    # Remove simple decimal noise from Excel numeric PN values, e.g. 16.0.
+    if re.fullmatch(r"\d+\.0", s):
+        s = s[:-2]
+
+    # Prefer explicit EVC SKU if present.
+    m = re.search(r"\bEVC[A-Z0-9]+\b", s)
+    if m:
+        return normalize_sku(m.group(0))
+
+    # Prefer 5-digit SKU, otherwise 2-5 digit numeric PN.
+    m = re.search(r"\b\d{5}\b", s)
+    if m:
+        return normalize_sku(m.group(0))
+    m = re.search(r"\b\d{2,5}\b", s)
+    if m:
+        return normalize_sku(m.group(0))
+
+    return normalize_sku(s)
+
+
+def read_asin_sku_mapping(mapping_path):
+    """Read ASIN -> sku_id mapping from the AMZ product mapping workbook."""
+    resolved = resolve_optional_file(mapping_path)
+    if not resolved:
+        print("Marketplace mapping file not found. marketplace portal signals will default to zero.")
+        return pd.DataFrame(columns=["ASIN", "sku_id"])
+
+    try:
+        xls = pd.ExcelFile(resolved)
+        frames = []
+        for sh in xls.sheet_names:
+            try:
+                tmp = pd.read_excel(resolved, sheet_name=sh)
+            except Exception:
+                continue
+            tmp_cols_upper = {str(c).strip().upper(): c for c in tmp.columns}
+            if "ASIN" not in tmp_cols_upper:
+                continue
+            asin_col = tmp_cols_upper["ASIN"]
+
+            sku_candidates = []
+            for name in ["PN", "QB REF", "SKU", "DESCRIPTION", "ITEM NAME", "PRODUCT TITLE"]:
+                if name in tmp_cols_upper:
+                    sku_candidates.append(tmp_cols_upper[name])
+            if not sku_candidates:
+                continue
+
+            use = tmp[[asin_col] + sku_candidates].copy()
+            use = use.rename(columns={asin_col: "ASIN"})
+            use["ASIN"] = use["ASIN"].astype(str).str.strip().str.upper()
+            use = use[~use["ASIN"].isin(["", "NAN", "TOTAL"])]
+
+            sku_series = pd.Series("", index=use.index, dtype="object")
+            # Priority: PN, QB REF, SKU, then description/title text.
+            for c in sku_candidates:
+                parsed = use[c].apply(normalize_vendor_sku)
+                sku_series = np.where(pd.Series(sku_series).astype(str).str.len() == 0, parsed, sku_series)
+                sku_series = pd.Series(sku_series, index=use.index, dtype="object")
+            use["sku_id"] = sku_series.apply(normalize_sku)
+            use = use[(use["sku_id"].astype(str).str.len() > 0) & (~use["sku_id"].isin(["NAN", "NONE"]))]
+            frames.append(use[["ASIN", "sku_id"]])
+
+        if not frames:
+            print(f"No ASIN mapping sheet found in: {resolved}")
+            return pd.DataFrame(columns=["ASIN", "sku_id"])
+
+        mapping = pd.concat(frames, ignore_index=True).drop_duplicates()
+        # If duplicates exist, keep the first SKU for each ASIN.
+        mapping = mapping.drop_duplicates(subset=["ASIN"], keep="first")
+        print(f"Marketplace mapping loaded: {len(mapping)} ASIN rows from {resolved}")
+        return mapping
+    except Exception as e:
+        print(f"Failed to read vendor mapping file: {e}")
+        return pd.DataFrame(columns=["ASIN", "sku_id"])
+
+
+def read_vendor_csv_with_header(path_or_pattern):
+    """marketplace portal CSVs usually have metadata in row 1 and real headers in row 2."""
+    resolved = resolve_optional_file(path_or_pattern)
+    if not resolved:
+        return None, None
+    try:
+        df = pd.read_csv(resolved, header=1)
+        return df, resolved
+    except Exception:
+        try:
+            df = pd.read_csv(resolved)
+            return df, resolved
+        except Exception as e:
+            print(f"Failed to read vendor csv {resolved}: {e}")
+            return None, resolved
+
+
+def build_vendor_forecast_features(mapping, horizon_days):
+    """Build forward-looking marketplace demand features from marketplace portal forecasting report."""
+    default_cols = [
+        "sku_id", "vendor_amz_mean_forecast_horizon", "vendor_amz_mean_forecast_4wk",
+        "vendor_amz_mean_forecast_later", "vendor_amz_forecast_momentum", "vendor_amz_peak_week_forecast",
+        "vendor_amz_forecast_volatility", "vendor_forecast_file_used",
+    ]
+    df, resolved = read_vendor_csv_with_header(VENDOR_FORECAST_FILE_PATTERN)
+    if df is None or df.empty or mapping.empty:
+        return pd.DataFrame(columns=default_cols)
+
+    if "ASIN" not in df.columns:
+        print("Marketplace forecast file found but ASIN column is missing. Skipping forecast signal.")
+        return pd.DataFrame(columns=default_cols)
+
+    df = df.copy()
+    df["ASIN"] = df["ASIN"].astype(str).str.strip().str.upper()
+    df = df.merge(mapping, on="ASIN", how="left")
+    df = df[df["sku_id"].notna()].copy()
+    if df.empty:
+        print("Marketplace forecast file did not map to target SKUs.")
+        return pd.DataFrame(columns=default_cols)
+
+    week_cols = [c for c in df.columns if re.match(r"^Week\s+\d+", str(c))]
+    week_cols = sorted(week_cols, key=lambda c: int(re.search(r"Week\s+(\d+)", str(c)).group(1)))
+    if not week_cols:
+        print("Marketplace forecast file has no Week columns. Skipping forecast signal.")
+        return pd.DataFrame(columns=default_cols)
+
+    horizon_weeks = int(np.ceil(max(float(horizon_days), 1.0) / 7.0))
+    horizon_week_cols = week_cols[:min(horizon_weeks, len(week_cols))]
+    first4_cols = week_cols[:min(4, len(week_cols))]
+    later_cols = week_cols[4:min(horizon_weeks, len(week_cols))]
+
+    for c in week_cols:
+        df[c] = df[c].apply(clean_number)
+
+    df["vendor_amz_mean_forecast_horizon"] = df[horizon_week_cols].sum(axis=1)
+    df["vendor_amz_mean_forecast_4wk"] = df[first4_cols].sum(axis=1) if first4_cols else 0.0
+    df["vendor_amz_mean_forecast_later"] = df[later_cols].sum(axis=1) if later_cols else 0.0
+    df["vendor_amz_peak_week_forecast"] = df[horizon_week_cols].max(axis=1)
+    df["vendor_amz_forecast_volatility"] = df[horizon_week_cols].std(axis=1).fillna(0.0)
+
+    first4_avg = df["vendor_amz_mean_forecast_4wk"] / max(len(first4_cols), 1)
+    later_avg = df["vendor_amz_mean_forecast_later"] / max(len(later_cols), 1) if later_cols else first4_avg
+    df["vendor_amz_forecast_momentum"] = later_avg / np.maximum(first4_avg, 1.0)
+
+    out = df.groupby("sku_id", as_index=False)[[
+        "vendor_amz_mean_forecast_horizon", "vendor_amz_mean_forecast_4wk", "vendor_amz_mean_forecast_later",
+        "vendor_amz_forecast_momentum", "vendor_amz_peak_week_forecast", "vendor_amz_forecast_volatility"
+    ]].sum()
+    out["vendor_forecast_file_used"] = str(resolved)
+    return out
+
+
+def build_vendor_inventory_features(mapping):
+    """Build Amazon inventory-pressure features from marketplace portal inventory report."""
+    default_cols = [
+        "sku_id", "vendor_amz_open_po_qty", "vendor_amz_sellable_on_hand_units",
+        "vendor_amz_unfilled_customer_ordered_units", "vendor_amz_sourceable_oos_pct",
+        "vendor_amz_lead_time_days", "vendor_inventory_file_used",
+    ]
+    df, resolved = read_vendor_csv_with_header(VENDOR_INVENTORY_FILE_PATTERN)
+    if df is None or df.empty or mapping.empty:
+        return pd.DataFrame(columns=default_cols)
+
+    if "ASIN" not in df.columns:
+        print("Marketplace inventory file found but ASIN column is missing. Skipping inventory signal.")
+        return pd.DataFrame(columns=default_cols)
+
+    df = df.copy()
+    df["ASIN"] = df["ASIN"].astype(str).str.strip().str.upper()
+    df = df.merge(mapping, on="ASIN", how="left")
+    df = df[df["sku_id"].notna()].copy()
+    if df.empty:
+        print("Marketplace inventory file did not map to target SKUs.")
+        return pd.DataFrame(columns=default_cols)
+
+    col_map = {
+        "Open Purchase Order Quantity": "vendor_amz_open_po_qty",
+        "Sellable On Hand Units": "vendor_amz_sellable_on_hand_units",
+        "Unfilled Customer Ordered Units": "vendor_amz_unfilled_customer_ordered_units",
+        "Sourceable Product OOS %": "vendor_amz_sourceable_oos_pct",
+        "Overall Vendor Lead Time (days)": "vendor_amz_lead_time_days",
+    }
+    for src, dest in col_map.items():
+        if src in df.columns:
+            df[dest] = df[src].apply(clean_number)
+        else:
+            df[dest] = 0.0
+
+    sum_cols = [
+        "vendor_amz_open_po_qty", "vendor_amz_sellable_on_hand_units",
+        "vendor_amz_unfilled_customer_ordered_units",
+    ]
+    out_sum = df.groupby("sku_id", as_index=False)[sum_cols].sum()
+    out_avg = df.groupby("sku_id", as_index=False)[["vendor_amz_sourceable_oos_pct", "vendor_amz_lead_time_days"]].mean()
+    out = out_sum.merge(out_avg, on="sku_id", how="left")
+    out["vendor_inventory_file_used"] = str(resolved)
+    return out
+
+
+def build_amz_share_business_features(mapping):
+    """Optional: read a top-sellers / AMZN share workbook if it contains ASIN or SKU + AMZ share columns."""
+    resolved = resolve_optional_file(AMZ_SHARE_OF_BUSINESS_FILE_PATTERN)
+    if not resolved:
+        return pd.DataFrame(columns=["sku_id", "external_amz_share_of_business", "amz_share_business_file_used"])
+
+    try:
+        xls = pd.ExcelFile(resolved)
+        frames = []
+        for sh in xls.sheet_names:
+            try:
+                tmp = pd.read_excel(resolved, sheet_name=sh)
+            except Exception:
+                continue
+            if tmp.empty:
+                continue
+            cols = list(tmp.columns)
+            lower = {str(c).strip().lower(): c for c in cols}
+
+            asin_col = next((c for c in cols if "asin" in str(c).lower()), None)
+            sku_col = next((c for c in cols if str(c).strip().lower() in ["sku", "pn", "part number", "item", "base item"]), None)
+            share_col = next((c for c in cols if ("share" in str(c).lower() or "%" in str(c).lower()) and ("amz" in str(c).lower() or "amazon" in str(c).lower())), None)
+            if share_col is None:
+                continue
+
+            use = tmp.copy()
+            if asin_col and not mapping.empty:
+                use["ASIN"] = use[asin_col].astype(str).str.strip().str.upper()
+                use = use.merge(mapping, on="ASIN", how="left")
+            elif sku_col:
+                use["sku_id"] = use[sku_col].apply(normalize_vendor_sku)
+            else:
+                continue
+
+            use["external_amz_share_of_business"] = use[share_col].apply(clean_number)
+            use = use[use["sku_id"].notna() & (use["sku_id"].astype(str).str.len() > 0)]
+            frames.append(use[["sku_id", "external_amz_share_of_business"]])
+
+        if not frames:
+            return pd.DataFrame(columns=["sku_id", "external_amz_share_of_business", "amz_share_business_file_used"])
+
+        out = pd.concat(frames, ignore_index=True)
+        out = out.groupby("sku_id", as_index=False)["external_amz_share_of_business"].mean()
+        out["amz_share_business_file_used"] = str(resolved)
+        print(f"AMZ share-of-business file loaded: {resolved}")
+        return out
+    except Exception as e:
+        print(f"Failed to read AMZ share-of-business file: {e}")
+        return pd.DataFrame(columns=["sku_id", "external_amz_share_of_business", "amz_share_business_file_used"])
+
+
+def load_vendor_forward_features(target_skus):
+    """Load and combine all marketplace portal forward-looking AMZ features by sku_id."""
+    target_skus = [normalize_sku(x) for x in target_skus]
+    base = pd.DataFrame({"sku_id": target_skus})
+
+    default_numeric = {
+        "vendor_amz_mean_forecast_horizon": 0.0,
+        "vendor_amz_mean_forecast_4wk": 0.0,
+        "vendor_amz_mean_forecast_later": 0.0,
+        "vendor_amz_forecast_momentum": 1.0,
+        "vendor_amz_peak_week_forecast": 0.0,
+        "vendor_amz_forecast_volatility": 0.0,
+        "vendor_amz_open_po_qty": 0.0,
+        "vendor_amz_sellable_on_hand_units": 0.0,
+        "vendor_amz_unfilled_customer_ordered_units": 0.0,
+        "vendor_amz_sourceable_oos_pct": 0.0,
+        "vendor_amz_lead_time_days": 0.0,
+        "external_amz_share_of_business": np.nan,
+    }
+
+    default_text = {
+        "vendor_signal_status": "NO_VENDOR_FILES",
+        "vendor_forecast_file_used": "",
+        "vendor_inventory_file_used": "",
+        "amz_share_business_file_used": "",
+    }
+
+    if not USE_VENDOR_FORWARD_SIGNAL:
+        for k, v in default_numeric.items():
+            base[k] = v
+        for k, v in default_text.items():
+            base[k] = v
+        return finalize_vendor_forward_features(base)
+
+    mapping = read_asin_sku_mapping(AMZ_MAPPING_FILE_PATTERN)
+    if mapping.empty:
+        for k, v in default_numeric.items():
+            base[k] = v
+        for k, v in default_text.items():
+            base[k] = v
+        return finalize_vendor_forward_features(base)
+
+    forecast = build_vendor_forecast_features(mapping, FORECAST_HORIZON_DAYS or 90)
+    inventory = build_vendor_inventory_features(mapping)
+    share = build_amz_share_business_features(mapping)
+
+    out = base.copy()
+    for part in [forecast, inventory, share]:
+        if part is not None and not part.empty:
+            out = out.merge(part, on="sku_id", how="left")
+
+    for k, v in default_numeric.items():
+        if k not in out.columns:
+            out[k] = v
+        else:
+            out[k] = out[k].fillna(v)
+    for k, v in default_text.items():
+        if k not in out.columns:
+            out[k] = v
+        else:
+            out[k] = out[k].fillna("")
+
+    has_any_vendor = (
+        (out["vendor_amz_mean_forecast_horizon"] > 0) |
+        (out["vendor_amz_sellable_on_hand_units"] > 0) |
+        (out["vendor_amz_open_po_qty"] > 0) |
+        (out["vendor_amz_unfilled_customer_ordered_units"] > 0)
+    )
+    out["vendor_signal_status"] = np.where(has_any_vendor, "VENDOR_SIGNAL_AVAILABLE", "NO_VENDOR_SIGNAL_FOR_SKU")
+    return finalize_vendor_forward_features(out)
+
+
+def finalize_vendor_forward_features(df):
+    """Derive inventory gap / DOS / bulk-buy-risk fields from marketplace portal features."""
+    df = df.copy()
+    horizon_weeks = max(int(np.ceil((FORECAST_HORIZON_DAYS or 90) / 7.0)), 1)
+
+    df["vendor_amz_weekly_avg_forecast"] = df["vendor_amz_mean_forecast_horizon"] / horizon_weeks
+    df["vendor_amz_projected_gap_horizon"] = (
+        df["vendor_amz_mean_forecast_horizon"] -
+        df["vendor_amz_sellable_on_hand_units"] -
+        df["vendor_amz_open_po_qty"]
+    )
+    df["vendor_amz_projected_gap_ratio"] = df["vendor_amz_projected_gap_horizon"] / np.maximum(df["vendor_amz_mean_forecast_horizon"], 1.0)
+    df["vendor_amz_days_of_supply"] = np.where(
+        df["vendor_amz_weekly_avg_forecast"] > 0,
+        df["vendor_amz_sellable_on_hand_units"] / np.maximum(df["vendor_amz_weekly_avg_forecast"], 0.01) * 7.0,
+        999.0,
+    )
+
+    lead_time_days = np.where(df["vendor_amz_lead_time_days"] > 0, df["vendor_amz_lead_time_days"], 45.0)
+    gap_score = np.clip(df["vendor_amz_projected_gap_ratio"], 0.0, 1.0)
+    dos_score = np.clip((lead_time_days - df["vendor_amz_days_of_supply"]) / np.maximum(lead_time_days, 1.0), 0.0, 1.0)
+    unfilled_score = np.clip(df["vendor_amz_unfilled_customer_ordered_units"] / np.maximum(df["vendor_amz_mean_forecast_horizon"], 1.0), 0.0, 1.0)
+    oos_score = np.clip(df["vendor_amz_sourceable_oos_pct"], 0.0, 1.0)
+    momentum_score = np.clip((df["vendor_amz_forecast_momentum"] - 1.0) / 0.75, 0.0, 1.0)
+
+    df["vendor_amz_bulk_buy_risk_score"] = np.clip(
+        0.45 * gap_score + 0.25 * dos_score + 0.15 * unfilled_score + 0.10 * momentum_score + 0.05 * oos_score,
+        0.0,
+        1.0,
+    )
+    return df
+
+
+def apply_vendor_forward_signal_layer(df):
+    """
+    Production-only layer. marketplace portal is current/future information, so it is not used in historical training.
+    It lightly adjusts the final non-marketplace forecast only when internal AMZ reliability is high enough.
+    """
+    df = df.copy()
+    if "vendor_amz_bulk_buy_risk_score" not in df.columns:
+        return df
+
+    df["forecast_before_vendor_signal_adjustment"] = df["forecast_target"]
+
+    internal_reliability = np.maximum(
+        np.clip(df["amz_share_recent_180"] / 0.60, 0.0, 1.0),
+        np.clip(df.get("external_amz_share_of_business", 0).fillna(0) / 0.60, 0.0, 1.0) if "external_amz_share_of_business" in df.columns else 0.0,
+    )
+    activity_reliability = np.clip(df["amz_order_count_all"] / 3.0, 0.0, 1.0)
+    reliability = internal_reliability * (0.50 + 0.50 * activity_reliability)
+    df["vendor_amz_signal_reliability"] = reliability
+
+    up_pressure = np.clip((df["vendor_amz_bulk_buy_risk_score"] - 0.50) / 0.50, 0.0, 1.0)
+    down_pressure = np.where(
+        (df["vendor_amz_bulk_buy_risk_score"] < 0.15) &
+        (df["vendor_amz_days_of_supply"] > 90) &
+        (df["vendor_amz_mean_forecast_horizon"] > 0),
+        np.clip((0.15 - df["vendor_amz_bulk_buy_risk_score"]) / 0.15, 0.0, 1.0),
+        0.0,
+    )
+
+    non_amz_trend_ok = df["momentum_30_90"] >= 0.65
+    vendor_available = df["vendor_signal_status"].eq("VENDOR_SIGNAL_AVAILABLE")
+    reliable_enough = reliability >= VENDOR_MIN_RELIABILITY_TO_ADJUST
+
+    raw_adj = (up_pressure * VENDOR_FORWARD_MAX_UPLIFT) + (down_pressure * VENDOR_FORWARD_MAX_DOWNLIFT)
+    raw_adj = raw_adj * reliability
+    raw_adj = np.where(vendor_available & reliable_enough & non_amz_trend_ok, raw_adj, 0.0)
+
+    df["vendor_forward_adjustment_pct"] = np.clip(raw_adj, VENDOR_FORWARD_MAX_DOWNLIFT, VENDOR_FORWARD_MAX_UPLIFT)
+
+    # Keep this as a light post-layer: target and range move together, preserving the original V37 shape.
+    adj_factor = 1.0 + df["vendor_forward_adjustment_pct"]
+    for c in ["forecast_target", "forecast_conservative", "forecast_aggressive"]:
+        if c in df.columns:
+            df[c] = df[c] * adj_factor
+
+    df["forecast_after_vendor_signal_adjustment"] = df["forecast_target"]
+    df["vendor_forward_signal_flag"] = np.select(
+        [
+            df["vendor_forward_adjustment_pct"] > 0.001,
+            df["vendor_forward_adjustment_pct"] < -0.001,
+            vendor_available & ~reliable_enough,
+            vendor_available,
+        ],
+        [
+            "VENDOR_FORWARD_REVIEW_UP",
+            "VENDOR_FORWARD_REVIEW_DOWN",
+            "VENDOR_AVAILABLE_BUT_LOW_RELIABILITY",
+            "VENDOR_SIGNAL_DIAGNOSTIC_ONLY",
+        ],
+        default="NO_VENDOR_SIGNAL",
+    )
+
+    df["decision_flag"] = np.where(
+        df["vendor_forward_adjustment_pct"].abs() > 0.001,
+        df["decision_flag"].astype(str) + "+" + df["vendor_forward_signal_flag"].astype(str),
+        df["decision_flag"],
+    )
+    return df
+
+
+# ==========================================
+# REGIME & FEATURES
+# ==========================================
+def classify_regime(features):
+    cv2 = features.get("cv2", 0.0)
+    adi = features.get("adi", 999.0)
+    non_zero_n = features.get("non_zero_order_count", 0)
+
+    if (adi > 12 and cv2 > 1.2) or (cv2 > 4.5 and non_zero_n >= 18):
+        return "LUMPY"
+    elif adi > 14:
+        return "INTERMITTENT"
+    elif features.get("spike_regime") in ["ACTIVE", "WEAKENING"]:
+        return "SPIKE_DRIVEN"
+    elif features.get("hhi", 0) > 6000 or features.get("active_customers", 0) <= 2:
+        return "FEW_CUSTOMERS"
+    else:
+        return "SMOOTH"
+
+
+def extract_features_at_cutoff(sku_past, cutoff, segment_past=None):
+    if sku_past.empty:
+        return None
+
+    total_sales = sku_past["sales"].sum()
+    if total_sales <= 0:
+        return None
+
+    history_days = max((cutoff - sku_past["date"].min()).days, 1)
+
+    full_idx_180 = pd.date_range(cutoff - pd.Timedelta(days=180), cutoff)
+    daily_all = sku_past.groupby("date")["sales"].sum().reindex(full_idx_180).fillna(0)
+
+    ewma_14 = float(daily_all.ewm(span=14, adjust=False).mean().iloc[-1])
+    ewma_30 = float(daily_all.ewm(span=30, adjust=False).mean().iloc[-1])
+    ewma_90 = float(daily_all.ewm(span=90, adjust=False).mean().iloc[-1])
+    momentum_14_30 = safe_div(ewma_14, max(ewma_30, 0.01), default=1.0)
+    momentum_30_90 = safe_div(ewma_30, max(ewma_90, 0.01), default=1.0)
+
+    daily = sku_past.groupby("date", as_index=False)["sales"].sum()
+    non_zero = daily.loc[daily["sales"] > 0, "sales"]
+
+    order_dates = pd.Series(sorted(sku_past["date"].dt.date.unique()))
+    adi = max((order_dates.max() - order_dates.min()).days, 1) / (len(order_dates) - 1) if len(order_dates) > 1 else 999.0
+
+    hhi = calc_hhi(sku_past)
+    active_customers = sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=180))]["customer"].nunique()
+    recent_zero_sales_days = (cutoff - sku_past["date"].max()).days
+    predictability = "HIGH" if adi <= 7 else ("MEDIUM" if adi <= 30 else "LOW")
+
+    historical_avg_daily = total_sales / history_days
+    trend_ratio = safe_div(ewma_90, max(historical_avg_daily, 0.01), default=1.0)
+
+    cv2 = float((non_zero.std() / non_zero.mean()) ** 2) if len(non_zero) > 1 and non_zero.mean() > 0 else 0.0
+    non_zero_order_count = int(len(non_zero))
+
+    recent_30_sales = float(sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=30))]["sales"].sum())
+    recent_60_sales = float(sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=60))]["sales"].sum())
+    recent_90_sales = float(sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=90))]["sales"].sum())
+    recent_180_sales = float(sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=180))]["sales"].sum())
+
+    recent_180_daily = daily[daily["date"] >= (cutoff - pd.Timedelta(days=180))].copy()
+    recent_180_non_zero = recent_180_daily.loc[recent_180_daily["sales"] > 0, "sales"]
+    recent_180_non_zero_order_count = int(len(recent_180_non_zero))
+
+    full_idx_all = pd.date_range(sku_past["date"].min(), cutoff)
+    daily_full_series = sku_past.groupby("date")["sales"].sum().reindex(full_idx_all).fillna(0)
+    rolling_90 = daily_full_series.rolling(90, min_periods=30).sum()
+    max_rolling_90_sales = float(rolling_90.max()) if len(rolling_90.dropna()) > 0 else recent_90_sales
+    p75_rolling_90_sales = float(np.percentile(rolling_90.dropna(), 75)) if len(rolling_90.dropna()) > 0 else recent_90_sales
+    p90_rolling_90_sales = float(np.percentile(rolling_90.dropna(), 90)) if len(rolling_90.dropna()) > 0 else recent_90_sales
+
+    if len(non_zero) == 0:
+        historical_spikes, recent_spikes, spike_regime = 0, 0, "NONE"
+    else:
+        spike_threshold = max(10.0, float(np.percentile(non_zero, 90)), float(non_zero.median()) * 2.0)
+        historical_spikes = int((daily["sales"] >= spike_threshold).sum())
+        recent_spikes = int((recent_180_daily["sales"] >= spike_threshold).sum())
+        if historical_spikes < 3:
+            spike_regime = "NONE"
+        else:
+            if recent_spikes == 0:
+                spike_regime = "DECAY"
+            elif safe_div(recent_spikes, historical_spikes, default=0.0) < 0.35:
+                spike_regime = "WEAKENING"
+            else:
+                spike_regime = "ACTIVE"
+
+    oos_threshold_days = float(np.clip(adi * OOS_ADI_MULTIPLIER, OOS_MIN_ZERO_GAP_DAYS, OOS_MAX_ZERO_GAP_DAYS))
+
+    all_dates = pd.DataFrame({"date": pd.date_range(sku_past["date"].min(), cutoff)})
+    daily_sales_full = pd.merge(all_dates, daily, on="date", how="left").fillna(0)
+    daily_sales_full["is_zero"] = (daily_sales_full["sales"] == 0).astype(int)
+    daily_sales_full["zero_streak"] = daily_sales_full["is_zero"].groupby((~daily_sales_full["is_zero"].astype(bool)).cumsum()).cumsum()
+
+    historical_oos_days = int((daily_sales_full["zero_streak"] > oos_threshold_days).sum())
+    suspected_oos_ratio = historical_oos_days / history_days
+
+    frequency_score = float(np.clip(1.0 - (adi / 30.0), 0.0, 1.0))
+    recent_activity_score = float(np.clip(recent_180_non_zero_order_count / 12.0, 0.0, 1.0))
+    volume_score = float(np.clip(recent_180_sales / 50.0, 0.0, 1.0))
+    gap_pressure = float(np.clip((recent_zero_sales_days - oos_threshold_days) / max(oos_threshold_days, 1.0), 0.0, 2.0) / 2.0)
+
+    oos_proxy_score = float(gap_pressure * (0.45 * frequency_score + 0.35 * recent_activity_score + 0.20 * volume_score))
+    is_currently_oos_proxy = 1 if oos_proxy_score >= SOFT_OOS_PROXY_SCORE else 0
+    is_strong_oos_proxy = 1 if oos_proxy_score >= STRONG_OOS_PROXY_SCORE else 0
+
+    recent_180_data = sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=180))]
+    total_recent_180 = recent_180_data["sales"].sum()
+    top_customer_share_recent_180, top_customer_days_since_last_order = 0.0, 180
+
+    if not recent_180_data.empty and total_recent_180 > 0:
+        cust_vols = recent_180_data.groupby("customer")["sales"].sum()
+        top_cust = cust_vols.idxmax()
+        top_customer_share_recent_180 = cust_vols.max() / total_recent_180
+        top_customer_days_since_last_order = (cutoff - recent_180_data[recent_180_data["customer"] == top_cust]["date"].max()).days
+
+    segment_spike_ratio = 0.0
+    if segment_past is not None and not segment_past.empty:
+        seg_90d = segment_past[segment_past["date"] >= (cutoff - pd.Timedelta(days=90))]
+        if not seg_90d.empty:
+            sku_vols = seg_90d.groupby("sku_id")["sales"].sum()
+            seg_30d = seg_90d[seg_90d["date"] >= (cutoff - pd.Timedelta(days=30))].groupby("sku_id")["sales"].sum()
+            total_skus_in_seg = len(sku_vols)
+            spiking_skus = 0
+            for s_id, vol_90 in sku_vols.items():
+                vol_30 = seg_30d.get(s_id, 0)
+                vol_prev_60 = vol_90 - vol_30
+                if vol_30 / 30.0 > (vol_prev_60 / 60.0) * 1.5:
+                    spiking_skus += 1
+            segment_spike_ratio = spiking_skus / total_skus_in_seg if total_skus_in_seg > 0 else 0.0
+
+    features = {
+        "history_days": int(history_days),
+        "adi": float(adi),
+        "hhi": float(hhi),
+        "cv2": float(cv2),
+        "non_zero_order_count": int(non_zero_order_count),
+        "recent_180_non_zero_order_count": int(recent_180_non_zero_order_count),
+        "active_customers": int(active_customers),
+        "recent_zero_sales_days": int(recent_zero_sales_days),
+        "predictability": predictability,
+        "historical_avg_daily": float(historical_avg_daily),
+        "trend_ratio": float(trend_ratio),
+        "momentum_14_30": float(momentum_14_30),
+        "momentum_30_90": float(momentum_30_90),
+        "historical_spikes": int(historical_spikes),
+        "recent_spikes": int(recent_spikes),
+        "spike_regime": spike_regime,
+        "top_customer_share_recent_180": float(top_customer_share_recent_180),
+        "top_customer_days_since_last_order": int(top_customer_days_since_last_order),
+        "recent_30_sales": float(recent_30_sales),
+        "recent_60_sales": float(recent_60_sales),
+        "recent_90_sales": float(recent_90_sales),
+        "recent_180_sales": float(recent_180_sales),
+        "max_rolling_90_sales": float(max_rolling_90_sales),
+        "p75_rolling_90_sales": float(p75_rolling_90_sales),
+        "p90_rolling_90_sales": float(p90_rolling_90_sales),
+        "oos_threshold_days": float(oos_threshold_days),
+        "suspected_oos_ratio": float(suspected_oos_ratio),
+        "oos_proxy_score": float(oos_proxy_score),
+        "is_currently_oos_proxy": int(is_currently_oos_proxy),
+        "is_strong_oos_proxy": int(is_strong_oos_proxy),
+        "segment_spike_ratio": float(segment_spike_ratio),
+    }
+    features["dominant_regime"] = classify_regime(features)
+    return features
+
+
+# ==========================================
+# V36 DEMAND RECONSTRUCTION HELPERS
+# ==========================================
+def estimate_oos_imputation(sku_past, cutoff, observed_features=None):
+    default = {
+        "imputed_lost_demand_180": 0.0,
+        "imputed_oos_days_180": 0,
+        "imputed_demand_ratio_180": 0.0,
+        "oos_reconstruction_flag": 0,
+    }
+    if sku_past.empty:
+        return sku_past.copy(), default
+
+    if observed_features is None:
+        observed_features = extract_features_at_cutoff(sku_past, cutoff)
+    if observed_features is None:
+        return sku_past.copy(), default
+
+    oos_proxy_score = observed_features.get("oos_proxy_score", 0.0)
+    if oos_proxy_score < SOFT_OOS_PROXY_SCORE:
+        return sku_past.copy(), default
+
+    threshold = float(observed_features.get("oos_threshold_days", 21.0))
+    start = max(sku_past["date"].min(), cutoff - pd.Timedelta(days=OOS_IMPUTE_LOOKBACK_DAYS))
+    full_dates = pd.date_range(start, cutoff)
+    daily = sku_past.groupby("date")["sales"].sum().reindex(full_dates).fillna(0.0)
+
+    recent_daily = daily[daily.index >= cutoff - pd.Timedelta(days=OOS_IMPUTE_RECENT_DAYS)]
+    recent_nonzero = recent_daily[recent_daily > 0]
+    all_nonzero = daily[daily > 0]
+    if len(all_nonzero) < 3:
+        return sku_past.copy(), default
+
+    recent_rate = float(recent_nonzero.mean()) if len(recent_nonzero) >= 3 else float(all_nonzero.tail(20).mean())
+    stable_rate = float(0.5 * all_nonzero.median() + 0.5 * all_nonzero.mean())
+    normal_daily_rate = min(recent_rate, stable_rate * OOS_IMPUTE_MAX_DAILY_MULTIPLIER)
+    if normal_daily_rate <= 0:
+        return sku_past.copy(), default
+
+    zero = (daily == 0).astype(int)
+    group_id = (zero == 0).cumsum()
+    zero_streak = zero.groupby(group_id).cumsum()
+
+    impute_rows = []
+    imputed_demand = 0.0
+    imputed_days = 0
+    recent_start = cutoff - pd.Timedelta(days=OOS_IMPUTE_RECENT_DAYS)
+
+    for dt, streak in zero_streak.items():
+        if dt < recent_start:
+            continue
+        if zero.loc[dt] == 1 and streak > threshold:
+            impute_rows.append({
+                "date": dt,
+                "sku_id": sku_past["sku_id"].iloc[0],
+                "customer": "__OOS_IMPUTED_DEMAND__",
+                "segment": sku_past["segment"].iloc[0] if "segment" in sku_past.columns else "UNKNOWN",
+                "sales": normal_daily_rate,
+            })
+            imputed_demand += normal_daily_rate
+            imputed_days += 1
+
+    recent_180_sales = float(sku_past[sku_past["date"] >= recent_start]["sales"].sum())
+    max_impute = max(10.0, recent_180_sales * OOS_IMPUTE_MAX_RATIO_OF_RECENT_180)
+
+    if imputed_demand > max_impute and imputed_demand > 0:
+        scale = max_impute / imputed_demand
+        for r in impute_rows:
+            r["sales"] *= scale
+        imputed_demand = max_impute
+
+    if not impute_rows or imputed_demand <= 0:
+        return sku_past.copy(), default
+
+    impute_df = pd.DataFrame(impute_rows)
+    reconstructed = pd.concat([sku_past.copy(), impute_df], ignore_index=True)
+    stats = {
+        "imputed_lost_demand_180": float(imputed_demand),
+        "imputed_oos_days_180": int(imputed_days),
+        "imputed_demand_ratio_180": float(imputed_demand / max(recent_180_sales, 1.0)),
+        "oos_reconstruction_flag": 1,
+    }
+    return reconstructed, stats
+
+
+def classify_spike_repeatability(sku_past, cutoff):
+    default = {
+        "spike_type": "NO_MAJOR_SPIKE",
+        "repeatable_spike_score": 0.0,
+        "recent_spike_customer_count": 0,
+    }
+    if sku_past.empty:
+        return default
+
+    daily = sku_past.groupby("date", as_index=False)["sales"].sum()
+    non_zero = daily.loc[daily["sales"] > 0, "sales"]
+    if len(non_zero) < 6:
+        return default
+
+    threshold = max(10.0, float(np.percentile(non_zero, 90)), float(non_zero.median()) * 2.0)
+    recent = sku_past[sku_past["date"] >= cutoff - pd.Timedelta(days=365)].copy()
+    if recent.empty:
+        return default
+
+    day_total = recent.groupby("date")["sales"].sum()
+    spike_days = day_total[day_total >= threshold].index
+    if len(spike_days) == 0:
+        return default
+
+    spike_rows = recent[recent["date"].isin(spike_days)].copy()
+    cust_spike_counts = spike_rows.groupby("customer")["date"].nunique().sort_values(ascending=False)
+    repeat_customers = cust_spike_counts[cust_spike_counts >= REPEATABLE_SPIKE_MIN_COUNT]
+    score = float(repeat_customers.sum() / max(cust_spike_counts.sum(), 1))
+
+    if len(spike_days) >= 3 and score >= 0.45:
+        spike_type = "REPEATABLE_CUSTOMER_SPIKE"
+    elif len(spike_days) <= 2 and score < 0.45:
+        spike_type = "LIKELY_ONE_TIME_SPIKE"
+    else:
+        spike_type = "MIXED_SPIKE_REVIEW"
+
+    return {
+        "spike_type": spike_type,
+        "repeatable_spike_score": score,
+        "recent_spike_customer_count": int(len(cust_spike_counts)),
+    }
+
+
+def estimate_customer_layer_forecast(sku_past, cutoff):
+    default = {
+        "customer_layer_forecast": 0.0,
+        "customer_layer_ratio": 1.0,
+        "top3_customer_share_recent_180": 0.0,
+        "customer_layer_signal": "NO_CUSTOMER_SIGNAL",
+    }
+    if sku_past.empty:
+        return default
+
+    lookback = sku_past[sku_past["date"] >= cutoff - pd.Timedelta(days=CUSTOMER_LAYER_LOOKBACK_DAYS)].copy()
+    if lookback.empty:
+        return default
+
+    recent_180 = sku_past[sku_past["date"] >= cutoff - pd.Timedelta(days=180)].copy()
+    recent_180_total = float(recent_180["sales"].sum())
+    cust_sales = lookback.groupby("customer")["sales"].sum().sort_values(ascending=False)
+    top_customers = cust_sales.head(CUSTOMER_LAYER_TOP_N).index.tolist()
+
+    top3_recent_sales = float(recent_180[recent_180["customer"].isin(top_customers)]["sales"].sum()) if not recent_180.empty else 0.0
+    top3_share = top3_recent_sales / max(recent_180_total, 1.0)
+
+    top_forecast = 0.0
+    active_top_count = 0
+    for cust in top_customers:
+        g = lookback[lookback["customer"] == cust].copy()
+        if g.empty:
+            continue
+        order_dates = pd.Series(sorted(g["date"].dt.date.unique()))
+        order_sizes = g.groupby("date")["sales"].sum()
+        avg_size = float(order_sizes.tail(5).mean()) if len(order_sizes) >= 2 else float(order_sizes.mean())
+        if len(order_dates) >= 2:
+            intervals = pd.to_datetime(order_dates).diff().dt.days.dropna()
+            avg_interval = max(float(intervals.median()), 1.0)
+            days_since = (cutoff - g["date"].max()).days
+            cycle_pressure = np.clip(days_since / avg_interval, 0.0, 1.50)
+            expected_orders = (FORECAST_HORIZON_DAYS / avg_interval) * (0.70 + 0.30 * cycle_pressure)
+            active_top_count += 1
+        else:
+            expected_orders = 0.25
+        top_forecast += avg_size * expected_orders
+
+    long_tail = lookback[~lookback["customer"].isin(top_customers)].copy()
+    long_tail_forecast = float(long_tail[long_tail["date"] >= cutoff - pd.Timedelta(days=180)]["sales"].sum() / 180.0 * FORECAST_HORIZON_DAYS) if not long_tail.empty else 0.0
+    customer_forecast = float(top_forecast + long_tail_forecast)
+
+    signal = "TOP_CUSTOMER_DRIVEN" if top3_share >= 0.60 else ("CUSTOMER_LAYER_AVAILABLE" if active_top_count > 0 else "NO_CUSTOMER_SIGNAL")
+    return {
+        "customer_layer_forecast": customer_forecast,
+        "customer_layer_ratio": 1.0,
+        "top3_customer_share_recent_180": float(top3_share),
+        "customer_layer_signal": signal,
+    }
+
+
+def build_forecast_row_for_sku(raw_target_non_amz, sku, cutoff, target_until_cutoff, signal_until_cutoff=None):
+    """
+    One-model structure:
+    - Existing forecast engine and target history use non-marketplace sales.
+    - AMZ/all-sales history is retained only as additional model features.
+    - Final forecast_target therefore remains non-marketplace.
+    """
+    sku_past_target = target_until_cutoff[target_until_cutoff["sku_id"] == sku].copy()
+    if sku_past_target.empty:
+        return None, None, None
+
+    if signal_until_cutoff is None:
+        signal_until_cutoff = target_until_cutoff
+    sku_past_signal_all = signal_until_cutoff[signal_until_cutoff["sku_id"] == sku].copy()
+    if sku_past_signal_all.empty:
+        sku_past_signal_all = sku_past_target.copy()
+
+    segment_name = sku_past_target["segment"].iloc[0] if "segment" in sku_past_target.columns and not pd.isna(sku_past_target["segment"].iloc[0]) else None
+    segment_past = target_until_cutoff[target_until_cutoff["segment"] == segment_name] if segment_name else None
+
+    observed_features = extract_features_at_cutoff(sku_past_target, cutoff, segment_past)
+    if observed_features is None:
+        return None, None, None
+
+    reconstructed_past, impute_stats = estimate_oos_imputation(sku_past_target, cutoff, observed_features)
+    reconstructed_features = extract_features_at_cutoff(reconstructed_past, cutoff, segment_past)
+    if reconstructed_features is None:
+        return None, None, None
+
+    # Keep OOS proxy from observed non-marketplace target history.
+    for k in [
+        "oos_threshold_days", "suspected_oos_ratio", "oos_proxy_score",
+        "is_currently_oos_proxy", "is_strong_oos_proxy", "recent_zero_sales_days",
+    ]:
+        reconstructed_features[k] = observed_features.get(k, reconstructed_features.get(k, 0))
+
+    reconstructed_features.update(impute_stats)
+    reconstructed_features.update(classify_spike_repeatability(sku_past_target, cutoff))
+
+    # AMZ is included here as signal features, not as target demand.
+    reconstructed_features.update(calc_amz_signal_features(sku_past_signal_all, cutoff))
+
+    race = run_horse_race(reconstructed_past, cutoff, reconstructed_features)
+    if race["final_forecast"] < MIN_FORECAST_THRESHOLD:
+        return None, None, None
+
+    customer_layer = estimate_customer_layer_forecast(sku_past_target, cutoff)
+    customer_layer["customer_layer_ratio"] = float(customer_layer["customer_layer_forecast"] / max(race["final_forecast"], 1.0))
+
+    row = reconstructed_features.copy()
+    row.update(customer_layer)
+    row.update({
+        "sku_id": sku,
+        "selected_model": race["best_model"],
+        "best_score": race["best_score"],
+        "model_score_gap": race.get("model_score_gap", 0.0),
+        "forecast_next_90days": race["final_forecast"],
+        "observed_recent_90_sales": float(sku_past_target[sku_past_target["date"] >= cutoff - pd.Timedelta(days=90)]["sales"].sum()),
+        "observed_recent_90_non_amz_sales": float(sku_past_target[sku_past_target["date"] >= cutoff - pd.Timedelta(days=90)]["sales"].sum()),
+    })
+    return row, reconstructed_past, observed_features
+
+
+# ==========================================
+# LAYER 1: FORECAST ENGINE
+# ==========================================
+def get_candidate_models(regime):
+    if regime == "LUMPY":
+        candidates = ["Lumpy_Median_SBA", "Baseline_Plus_Spike_V2", "SBA", "WMA_60"]
+    elif regime == "INTERMITTENT":
+        candidates = ["SBA", "Lumpy_Median_SBA", "Baseline_Plus_Spike_V2", "SMA_30"]
+    elif regime == "SPIKE_DRIVEN":
+        candidates = ["Capped_Mean_90", "Baseline_Plus_Spike_V2"]
+    elif regime == "FEW_CUSTOMERS":
+        candidates = ["Few_Customers_TopSplit", "Trend_Blend_Dynamic", "Recent_90_RunRate", "WMA_60"]
+    else:
+        candidates = ["Recent_90_RunRate", "Trend_Blend_Dynamic", "Capped_Mean_90", "SMA_30", "WMA_60"]
+
+    model_order = [
+        "Lumpy_Median_SBA", "Recent_90_RunRate", "Trend_Blend_Dynamic", "Capped_Mean_90",
+        "SMA_30", "WMA_60", "Few_Customers_TopSplit", "SBA", "Baseline_Plus_Spike_V2"
+    ]
+    return [m for m in model_order if m in candidates]
+
+
+def run_single_model_forecast(model_name, sku_past, cutoff, features):
+    daily = sku_past.groupby("date", as_index=False)["sales"].sum()
+    non_zero = daily[daily["sales"] > 0]["sales"]
+    if len(non_zero) == 0:
+        return 0.0
+
+    recent_90_sum = sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=90))]["sales"].sum()
+
+    if model_name == "SMA_30":
+        return float((sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=30))]["sales"].sum() / 30.0) * FORECAST_HORIZON_DAYS)
+
+    elif model_name == "WMA_60":
+        r30 = sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=30))]["sales"].sum()
+        p30 = sku_past[(sku_past["date"] >= (cutoff - pd.Timedelta(days=60))) & (sku_past["date"] < (cutoff - pd.Timedelta(days=30)))]["sales"].sum()
+        return float(((r30 * 0.7 + p30 * 0.3) / 30.0) * FORECAST_HORIZON_DAYS)
+
+    elif model_name == "Lumpy_Median_SBA":
+        intervals = pd.Series(pd.to_datetime(sorted(daily[daily["sales"] > 0]["date"].dt.date.unique()))).diff().dt.days.dropna()
+        interval = max(intervals.median(), 1.0) if not intervals.empty else 999.0
+        base = float(((float(non_zero.median() * 0.5 + np.percentile(non_zero, 75) * 0.5)) / interval) * FORECAST_HORIZON_DAYS)
+        return base * (0.85 if features.get("trend_ratio", 1.0) < 0.4 else (0.95 if features.get("trend_ratio", 1.0) < 0.6 else 1.0))
+
+    elif model_name == "Recent_90_RunRate":
+        return float(recent_90_sum)
+
+    elif model_name == "Few_Customers_TopSplit":
+        recent_180 = sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=180))]
+        if recent_180.empty:
+            return float(recent_90_sum * 0.8)
+        cust_vol = recent_180.groupby("customer")["sales"].sum()
+        if cust_vol.empty:
+            return float(recent_90_sum * 0.8)
+        top_cust = cust_vol.idxmax()
+        top_part = sku_past[(sku_past["customer"] == top_cust) & (sku_past["date"] >= (cutoff - pd.Timedelta(days=90)))]["sales"].sum() * 0.85
+        other_part = (recent_180[recent_180["customer"] != top_cust]["sales"].sum() / 180.0) * FORECAST_HORIZON_DAYS
+        return float(top_part + other_part)
+
+    elif model_name == "SBA":
+        order_dates = pd.Series(sorted(daily[daily["sales"] > 0]["date"].dt.date.unique()))
+        interval = max((order_dates.max() - order_dates.min()).days, 1) / (len(order_dates) - 1) if len(order_dates) > 1 else 999.0
+        return safe_div(float(non_zero.mean()), interval, default=0.0) * FORECAST_HORIZON_DAYS
+
+    elif model_name == "Capped_Mean_90":
+        r90_daily = sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=90))].groupby("date", as_index=False)["sales"].sum()
+        r90_non_zero = r90_daily[r90_daily["sales"] > 0]["sales"]
+        if len(r90_non_zero) == 0:
+            return 0.0
+        capped_sum = float(r90_daily["sales"].clip(upper=max(float(np.percentile(r90_non_zero, 90)), 1.0)).sum())
+        if features.get("recent_spikes", 0) >= 2 and features.get("trend_ratio", 1.0) >= 1.0:
+            capped_sum = max(capped_sum * 1.10, float(r90_daily["sales"].clip(upper=max(float(np.percentile(r90_non_zero, 95)), 1.0)).sum()))
+        return capped_sum
+
+    elif model_name == "Trend_Blend_Dynamic":
+        rw = np.clip(features["trend_ratio"], 0.3, 0.8)
+        hw = 1.0 - rw
+        recent_rate = sku_past[sku_past["date"] >= (cutoff - pd.Timedelta(days=60))]["sales"].sum() / 60.0
+        hist_rate = sku_past["sales"].sum() / max((cutoff - sku_past["date"].min()).days, 1)
+        return float(((recent_rate * rw) + (hist_rate * hw)) * FORECAST_HORIZON_DAYS)
+
+    elif model_name == "Baseline_Plus_Spike_V2":
+        r180_daily = daily[daily["date"] >= (cutoff - pd.Timedelta(days=180))]
+        r180_non_zero = r180_daily[r180_daily["sales"] > 0]["sales"]
+        recent_p85 = float(np.percentile(r180_non_zero, 85)) if not r180_non_zero.empty else float(np.percentile(non_zero, 85))
+        spike_thresh = max(10.0, 0.4 * float(np.percentile(non_zero, 85)) + 0.6 * recent_p85, float(non_zero.median()) * 2.5)
+
+        spikes_all = daily[daily["sales"] >= spike_thresh]["sales"]
+        r_normals = r180_daily[(r180_daily["sales"] > 0) & (r180_daily["sales"] < spike_thresh)]["sales"]
+        if not r_normals.empty:
+            normal_rate = r_normals.sum() / 180.0
+        else:
+            all_normals = daily[(daily["sales"] > 0) & (daily["sales"] < spike_thresh)]["sales"]
+            normal_rate = all_normals.sum() / max((cutoff - sku_past["date"].min()).days, 1) if not all_normals.empty else 0.0
+
+        if len(spikes_all) > 0:
+            r_spikes = r180_daily[r180_daily["sales"] >= spike_thresh]["sales"]
+            freq_r = len(r_spikes) / 180.0 if len(r_spikes) > 0 else 0.0
+            size_r = r_spikes.mean() if len(r_spikes) > 0 else spikes_all.mean()
+            days_since = (cutoff - r180_daily[r180_daily["sales"] >= spike_thresh]["date"].max()).days if len(r_spikes) > 0 else 180
+            spike_vol = (((0.4 * (len(spikes_all) / max((cutoff - sku_past["date"].min()).days, 1))) + (0.6 * freq_r)) * np.exp(-days_since / 150.0)) * ((0.4 * spikes_all.mean()) + (0.6 * size_r)) * FORECAST_HORIZON_DAYS
+        else:
+            spike_vol = 0.0
+        return float((normal_rate * FORECAST_HORIZON_DAYS) + spike_vol)
+
+    return 0.0
+
+
+def _recent_history_fallback_forecast(features):
+    """Safety fallback used only when the validation-selected model forecasts near zero.
+
+    Some SKUs are valid target SKUs with meaningful recent 60/90/180-day demand, but a
+    short-window model such as SMA_30 can return 0 if the last 30 non-marketplace days were quiet.
+    Returning 0 then causes build_forecast_row_for_sku() to drop the SKU. This fallback keeps
+    those SKUs in the output while still staying conservative.
+    """
+    recent_90 = float(features.get("recent_90_sales", 0.0) or 0.0)
+    recent_180 = float(features.get("recent_180_sales", 0.0) or 0.0)
+    historical_avg_daily = float(features.get("historical_avg_daily", 0.0) or 0.0)
+    horizon_days = float(FORECAST_HORIZON_DAYS or 90)
+
+    recent_180_run_rate = recent_180 / 180.0 * horizon_days
+    historical_run_rate = historical_avg_daily * horizon_days
+
+    # Conservative floor: use the strongest real signal among recent 90, recent 180 run-rate,
+    # and full-history run-rate, then cap it so one old spike does not dominate.
+    fallback = max(recent_90, recent_180_run_rate, historical_run_rate, 0.0)
+    cap = max(recent_90 * 1.25, recent_180 * 0.85, MIN_FORECAST_THRESHOLD)
+    return float(min(fallback, cap))
+
+
+def run_horse_race(sku_past, cutoff, features):
+    candidate_models = get_candidate_models(features["dominant_regime"])
+    valid_windows_count = 0
+    model_scores = {m: 0.0 for m in candidate_models}
+
+    for offset in [90, 180, 270]:
+        val_start = cutoff - pd.Timedelta(days=offset)
+        train_internal = sku_past[sku_past["date"] < val_start]
+        valid_internal = sku_past[(sku_past["date"] >= val_start) & (sku_past["date"] < val_start + pd.Timedelta(days=90))]
+        if train_internal.empty or valid_internal.empty:
+            continue
+
+        features_internal = extract_features_at_cutoff(train_internal, val_start)
+        if features_internal is None:
+            continue
+
+        actual_valid = valid_internal["sales"].sum()
+        for m in candidate_models:
+            pred_val = run_single_model_forecast(m, train_internal, val_start, features_internal)
+            model_scores[m] += abs(actual_valid - pred_val) / max(actual_valid, 1.0)
+        valid_windows_count += 1
+
+    current_forecasts = {
+        m: float(run_single_model_forecast(m, sku_past, cutoff, features))
+        for m in candidate_models
+    }
+
+    if valid_windows_count == 0:
+        best_model = candidate_models[0]
+        final_forecast = current_forecasts.get(best_model, 0.0)
+        if final_forecast < MIN_FORECAST_THRESHOLD and float(features.get("recent_180_sales", 0.0) or 0.0) > 0:
+            nonzero_candidates = [(m, v) for m, v in current_forecasts.items() if v >= MIN_FORECAST_THRESHOLD]
+            if nonzero_candidates:
+                best_model, final_forecast = nonzero_candidates[0]
+            else:
+                best_model = best_model + "+RECENT_HISTORY_FALLBACK"
+                final_forecast = _recent_history_fallback_forecast(features)
+        return {
+            "best_model": best_model,
+            "final_forecast": final_forecast,
+            "best_score": 999.0,
+            "model_score_gap": 0.0,
+        }
+
+    avg_scores = {m: score / valid_windows_count for m, score in model_scores.items()}
+    sorted_models = sorted(avg_scores.items(), key=lambda x: x[1])
+    gap = sorted_models[1][1] - sorted_models[0][1] if len(sorted_models) > 1 else 0.0
+
+    best_model = sorted_models[0][0]
+    final_forecast = current_forecasts.get(best_model, 0.0)
+
+    # Important production guard:
+    # If the historically best model gives a near-zero current forecast, but the SKU still has
+    # real recent 60/90/180-day non-marketplace demand, do not drop the SKU from the output.
+    # This is the exact issue that caused 92633 to disappear when SMA_30 returned 0.
+    if final_forecast < MIN_FORECAST_THRESHOLD and float(features.get("recent_180_sales", 0.0) or 0.0) > 0:
+        nonzero_by_score = [
+            (m, avg_scores[m], current_forecasts[m])
+            for m, _ in sorted_models
+            if current_forecasts.get(m, 0.0) >= MIN_FORECAST_THRESHOLD
+        ]
+        if nonzero_by_score:
+            best_model, _, final_forecast = nonzero_by_score[0]
+        else:
+            best_model = best_model + "+RECENT_HISTORY_FALLBACK"
+            final_forecast = _recent_history_fallback_forecast(features)
+
+    return {
+        "best_model": best_model,
+        "final_forecast": final_forecast,
+        "best_score": sorted_models[0][1],
+        "model_score_gap": gap,
+    }
+
+
+# ==========================================
+# TRAINING DATA BUILDER
+# ==========================================
+def feature_columns():
+    f_num = [
+        "adi", "hhi", "cv2", "non_zero_order_count", "recent_180_non_zero_order_count",
+        "recent_zero_sales_days", "active_customers", "trend_ratio", "momentum_14_30", "momentum_30_90",
+        "historical_spikes", "recent_spikes", "best_score", "model_score_gap",
+        "top_customer_share_recent_180", "top_customer_days_since_last_order",
+        "recent_30_sales", "recent_60_sales", "recent_90_sales", "recent_180_sales",
+        "max_rolling_90_sales", "p75_rolling_90_sales", "p90_rolling_90_sales",
+        "oos_threshold_days", "suspected_oos_ratio", "oos_proxy_score", "is_currently_oos_proxy",
+        "is_strong_oos_proxy", "segment_spike_ratio",
+        "imputed_lost_demand_180", "imputed_oos_days_180", "imputed_demand_ratio_180", "oos_reconstruction_flag",
+        "customer_layer_forecast", "customer_layer_ratio", "top3_customer_share_recent_180",
+        "repeatable_spike_score", "recent_spike_customer_count", "observed_recent_90_sales",
+
+        # AMZ/all-sales signal features. These are features only; target remains non-marketplace.
+        "amz_recent_30_sales", "amz_recent_60_sales", "amz_recent_90_sales", "amz_recent_180_sales",
+        "total_recent_30_sales", "total_recent_60_sales", "total_recent_90_sales", "total_recent_180_sales",
+        "non_amz_recent_30_sales_check", "non_amz_recent_60_sales_check", "non_amz_recent_90_sales_check", "non_amz_recent_180_sales_check",
+        "amz_share_recent_30", "amz_share_recent_60", "amz_share_recent_90", "amz_share_recent_180",
+        "non_amz_share_recent_180", "amz_momentum_30_90", "amz_days_since_last_order", "amz_spike_count_180", "amz_present_flag",
+        "amz_order_count_all", "amz_order_count_180", "amz_avg_order_size_all", "amz_recent_avg_order_size",
+        "amz_order_size_ratio", "amz_avg_interval_all", "amz_median_interval_all", "amz_recent_median_interval",
+        "amz_interval_ratio", "amz_due_score", "amz_cycle_signal_strength",
+
+        # marketplace portal forward signal is production-only.
+        # Do NOT include these columns in training features, because they are current/future vendor report
+        # fields and do not exist in historical training rows. They are applied after the base V37
+        # forecast is produced, through apply_vendor_forward_signal_layer().
+    ]
+    f_cat = [
+        "predictability", "selected_model", "spike_regime", "dominant_regime",
+        "spike_type", "customer_layer_signal", "amz_cycle_status",
+    ]
+    return f_num, f_cat
+
+def export_feature_diagnostic_table(raw_target_non_amz, raw_signal_all, output_path):
+    cutoff = pd.to_datetime(PRODUCTION_CUTOFF)
+    target_until_cutoff = raw_target_non_amz[raw_target_non_amz["date"] <= cutoff].copy()
+    signal_until_cutoff = raw_signal_all[raw_signal_all["date"] <= cutoff].copy()
+    rows = []
+    # Keep diagnostic output in the default sample target order.
+    target_sku_order = unique_target_skus()
+    available_skus = set(target_until_cutoff["sku_id"].unique())
+
+    for sku in target_sku_order:
+        if sku not in available_skus:
+            continue
+        row, _, _ = build_forecast_row_for_sku(raw_target_non_amz, sku, cutoff, target_until_cutoff, signal_until_cutoff)
+        if row is not None:
+            rows.append(row)
+
+    if rows:
+        pd.DataFrame(rows).sort_values(["dominant_regime", "sku_id"]).to_csv(output_path, index=False, encoding="utf-8-sig")
+
+
+def build_uplift_training_data(raw_target_non_amz, raw_signal_all):
+    """
+    Build one training table.
+    Features: non-marketplace target history + AMZ/all-sales signal features.
+    Target: future non-marketplace auto-horizon demand.
+    """
+    start_date = raw_target_non_amz["date"].min() + pd.Timedelta(days=MIN_HISTORY_DAYS)
+    end_date = raw_target_non_amz["date"].max() - pd.Timedelta(days=FORECAST_HORIZON_DAYS)
+    training_rows = []
+
+    for cutoff in pd.date_range(start=start_date, end=end_date, freq=f"{ROLLING_FREQ_DAYS}D"):
+        past_target = raw_target_non_amz[raw_target_non_amz["date"] < cutoff].copy()
+        past_signal = raw_signal_all[raw_signal_all["date"] < cutoff].copy()
+        future_target = raw_target_non_amz[(raw_target_non_amz["date"] >= cutoff) & (raw_target_non_amz["date"] < cutoff + pd.Timedelta(days=FORECAST_HORIZON_DAYS))]
+        active_skus = past_target[past_target["date"] >= (cutoff - pd.Timedelta(days=180))]["sku_id"].unique()
+
+        for sku in active_skus:
+            row, _, _ = build_forecast_row_for_sku(raw_target_non_amz, sku, cutoff, past_target, past_signal)
+            if row is None:
+                continue
+            if row["predictability"] == "LOW" and row["non_zero_order_count"] < 6 and row["recent_180_non_zero_order_count"] < 2:
+                continue
+
+            actual_90 = future_target[future_target["sku_id"] == sku]["sales"].sum() if not future_target[future_target["sku_id"] == sku].empty else 0.0
+
+            is_underforecast = 1 if actual_90 > row["forecast_next_90days"] * 1.20 else 0
+            is_overforecast = 1 if actual_90 < row["forecast_next_90days"] * 0.80 else 0
+            target_ratio = np.clip(actual_90 / max(row["forecast_next_90days"], 1.0), 0.55, 2.50)
+
+            row.update({
+                "cutoff_date": cutoff,
+                "actual_next_90days": actual_90,
+                "is_underforecast_risk": is_underforecast,
+                "is_overforecast_risk": is_overforecast,
+                "target_ratio": target_ratio,
+            })
+            training_rows.append(row)
+
+    return pd.DataFrame(training_rows)
+
+def predict_ensemble(models, X, mode="proba"):
+    preds = [predict_prob_positive(m, X) if mode == "proba" else m.predict(X) for m in models]
+    return np.mean(preds, axis=0)
+
+
+# ==========================================
+# V36 DECISION LAYER
+# ==========================================
+def apply_smart_decision_layer(df):
+    df = df.copy()
+
+    df["reconstructed_baseline_forecast"] = df["forecast_next_90days"]
+    df["ml_raw_forecast"] = df["reconstructed_baseline_forecast"] * df["pred_target_ratio"]
+    df["net_underforecast_score"] = df["prob_underforecast"] - df["prob_overforecast"]
+
+    base_blend = np.clip(np.abs(df["net_underforecast_score"]) * 1.15, 0.0, 0.50)
+    oos_extra_blend = np.where(
+        (df["oos_reconstruction_flag"] == 1) & (df["net_underforecast_score"] > 0.05),
+        np.clip(df["oos_proxy_score"] * 0.20, 0.0, 0.18),
+        0.0,
+    )
+    df["ml_blend_factor"] = np.clip(base_blend + oos_extra_blend, 0.0, 0.65)
+
+    df["forecast_target"] = (
+        df["reconstructed_baseline_forecast"] * (1 - df["ml_blend_factor"]) +
+        df["ml_raw_forecast"] * df["ml_blend_factor"]
+    )
+
+    valid_customer_layer = (
+        (df["customer_layer_forecast"] > 0) &
+        (df["top3_customer_share_recent_180"] >= 0.35) &
+        (df["customer_layer_ratio"].between(0.55, 1.85))
+    )
+    customer_strength = np.clip((df["top3_customer_share_recent_180"] - 0.35) / 0.55, 0.0, 1.0) * CUSTOMER_LAYER_MAX_BLEND
+    df["customer_blend_factor"] = np.where(valid_customer_layer, customer_strength, 0.0)
+    df["forecast_target"] = (
+        df["forecast_target"] * (1 - df["customer_blend_factor"]) +
+        df["customer_layer_forecast"] * df["customer_blend_factor"]
+    )
+
+    strong_oos_mask = (
+        (df["oos_proxy_score"] >= STRONG_OOS_PROXY_SCORE) &
+        (df["prob_underforecast"] > df["prob_overforecast"] + 0.08)
+    )
+    soft_oos_mask = (
+        (df["oos_proxy_score"] >= SOFT_OOS_PROXY_SCORE) &
+        (df["prob_underforecast"] >= df["prob_overforecast"])
+    )
+    df.loc[soft_oos_mask, "forecast_target"] = np.maximum(
+        df.loc[soft_oos_mask, "forecast_target"],
+        df.loc[soft_oos_mask, "reconstructed_baseline_forecast"] * 1.04,
+    )
+    df.loc[strong_oos_mask, "forecast_target"] = np.maximum(
+        df.loc[strong_oos_mask, "forecast_target"],
+        df.loc[strong_oos_mask, "reconstructed_baseline_forecast"] * 1.10,
+    )
+
+    repeatable_spike_mask = df["spike_type"].eq("REPEATABLE_CUSTOMER_SPIKE") & (df["repeatable_spike_score"] >= 0.45)
+    one_time_spike_mask = df["spike_type"].eq("LIKELY_ONE_TIME_SPIKE") & (df["prob_underforecast"] <= df["prob_overforecast"])
+
+    # AMZ cycle signal is deliberately bounded. It can help the non-marketplace target when AMZ timing
+    # historically looks like a market/replenishment signal, but it should not overpower the non-marketplace baseline.
+    amz_cycle_up_mask = (
+        df["amz_cycle_status"].isin(["AMZ_CYCLE_ACCELERATING", "AMZ_ORDER_SIZE_EXPANDING"]) &
+        (df["amz_present_flag"] == 1) &
+        (df["prob_underforecast"] >= df["prob_overforecast"] - 0.05) &
+        (df["momentum_30_90"] >= 0.65)
+    )
+    amz_cycle_down_mask = (
+        df["amz_cycle_status"].isin(["AMZ_CYCLE_SLOWING_OR_DELAYED", "AMZ_POSSIBLE_INACTIVE", "AMZ_ORDER_SIZE_SHRINKING"]) &
+        (df["amz_present_flag"] == 1) &
+        (df["prob_overforecast"] >= df["prob_underforecast"] - 0.05)
+    )
+
+    df.loc[amz_cycle_up_mask, "forecast_target"] = np.maximum(
+        df.loc[amz_cycle_up_mask, "forecast_target"],
+        df.loc[amz_cycle_up_mask, "reconstructed_baseline_forecast"] * 1.04,
+    )
+    df.loc[amz_cycle_down_mask, "forecast_target"] = np.minimum(
+        df.loc[amz_cycle_down_mask, "forecast_target"],
+        df.loc[amz_cycle_down_mask, "reconstructed_baseline_forecast"] * 0.98,
+    )
+
+    df.loc[repeatable_spike_mask, "forecast_target"] = np.maximum(
+        df.loc[repeatable_spike_mask, "forecast_target"],
+        df.loc[repeatable_spike_mask, "reconstructed_baseline_forecast"] * 1.03,
+    )
+    df.loc[one_time_spike_mask, "forecast_target"] = np.minimum(
+        df.loc[one_time_spike_mask, "forecast_target"],
+        df.loc[one_time_spike_mask, "reconstructed_baseline_forecast"] * 1.02,
+    )
+
+    # Explicit AMZ cycle transfer layer.
+    # The earlier version only let AMZ affect forecast indirectly through ML probability/ratio.
+    # That can result in no visible change after rounding and guardrails.
+    # This layer keeps the target as non-marketplace, but applies a bounded adjustment when AMZ
+    # replenishment rhythm clearly changes.
+    df["forecast_before_amz_cycle_adjustment"] = df["forecast_target"]
+
+    amz_share_weight = np.clip(df["amz_share_recent_180"] / 0.60, 0.0, 1.0)
+    amz_activity_weight = np.clip(df["amz_order_count_180"] / 3.0, 0.0, 1.0)
+    amz_momentum_weight = np.clip((df["amz_momentum_30_90"] - 1.0) / 2.0, -0.60, 0.80)
+
+    cycle_base_adj = df["amz_cycle_signal_strength"] * 0.12
+    momentum_adj = amz_momentum_weight * 0.06
+    raw_amz_adj = (cycle_base_adj + momentum_adj) * (0.35 + 0.65 * amz_share_weight) * (0.50 + 0.50 * amz_activity_weight)
+
+    # If AMZ share is tiny, do not let a random AMZ order move non-marketplace forecast much.
+    raw_amz_adj = np.where(df["amz_share_recent_180"] < 0.08, raw_amz_adj * 0.25, raw_amz_adj)
+
+    # Business-safe bounds: AMZ can help, but it cannot dominate the non-marketplace target.
+    df["amz_cycle_adjustment_pct"] = np.clip(raw_amz_adj, -0.10, 0.12)
+    df["forecast_target"] = df["forecast_target"] * (1.0 + df["amz_cycle_adjustment_pct"])
+    df["forecast_after_amz_cycle_before_cap"] = df["forecast_target"]
+
+    standard_cap = df["reconstructed_baseline_forecast"] * MAX_STANDARD_UPLIFT
+    strong_oos_cap = df["reconstructed_baseline_forecast"] * MAX_STRONG_OOS_UPLIFT
+    history_cap = np.maximum.reduce([
+        df["reconstructed_baseline_forecast"] * MAX_GENERAL_CAP,
+        df["recent_90_sales"] * 1.40,
+        df["p90_rolling_90_sales"] * 1.30,
+        df["max_rolling_90_sales"] * 1.08,
+        (df["recent_180_sales"] + df["imputed_lost_demand_180"]) * 0.90,
+    ])
+
+    allowed_cap = np.where(strong_oos_mask | repeatable_spike_mask, np.maximum(strong_oos_cap, standard_cap), standard_cap)
+    final_upper_cap = np.maximum(allowed_cap, np.minimum(history_cap, df["reconstructed_baseline_forecast"] * MAX_GENERAL_CAP))
+
+    lower_cap_normal = df["reconstructed_baseline_forecast"] * 0.68
+    lower_cap_oos = df["reconstructed_baseline_forecast"] * 0.88
+    final_lower_cap = np.where(soft_oos_mask | strong_oos_mask, lower_cap_oos, lower_cap_normal)
+
+    df["forecast_target"] = np.clip(df["forecast_target"], final_lower_cap, final_upper_cap)
+
+    confidence_raw = 1.0
+    confidence_raw -= np.clip(df["best_score"] / 2.5, 0.0, 0.35)
+    confidence_raw -= np.where(df["model_score_gap"] < 0.05, 0.12, 0.0)
+    confidence_raw -= np.where(df["oos_reconstruction_flag"] == 1, 0.10, 0.0)
+    confidence_raw -= np.where(df["spike_type"].isin(["LIKELY_ONE_TIME_SPIKE", "MIXED_SPIKE_REVIEW"]), 0.10, 0.0)
+    confidence_raw -= np.where(df["top3_customer_share_recent_180"] >= 0.75, 0.08, 0.0)
+    confidence_raw -= np.where(df["amz_cycle_status"].isin(["AMZ_POSSIBLE_INACTIVE", "AMZ_CYCLE_SLOWING_OR_DELAYED"]), 0.05, 0.0)
+    df["confidence_score"] = np.clip(confidence_raw, 0.20, 0.95)
+
+    df["main_reason_code"] = np.select(
+        [
+            strong_oos_mask,
+            soft_oos_mask,
+            repeatable_spike_mask,
+            one_time_spike_mask,
+            valid_customer_layer & (df["customer_layer_ratio"] > 1.10),
+            valid_customer_layer & (df["customer_layer_ratio"] < 0.90),
+            amz_cycle_up_mask,
+            amz_cycle_down_mask,
+            df["prob_overforecast"] > df["prob_underforecast"] + 0.20,
+            df["prob_underforecast"] > df["prob_overforecast"] + 0.20,
+        ],
+        [
+            "OOS_RECONSTRUCTED_REVIEW_UP",
+            "SOFT_OOS_RECONSTRUCTION",
+            "REPEATABLE_SPIKE_INCLUDED",
+            "ONE_TIME_SPIKE_CAPPED",
+            "CUSTOMER_LAYER_REVIEW_UP",
+            "CUSTOMER_LAYER_REVIEW_DOWN",
+            "AMZ_CYCLE_SIGNAL_REVIEW_UP",
+            "AMZ_CYCLE_SIGNAL_REVIEW_DOWN",
+            "OVERFORECAST_REVIEW_DOWN",
+            "UNDERFORECAST_REVIEW_UP",
+        ],
+        default="STABLE_OR_LIGHT_REVIEW",
+    )
+    df["decision_flag"] = df["main_reason_code"]
+
+    df["dynamic_spread"] = np.clip(0.10 + 0.08 * df["best_score"] + (1 - df["confidence_score"]) * 0.10, 0.10, 0.32)
+    df["forecast_aggressive"] = np.where(
+        df["prob_underforecast"] > df["prob_overforecast"],
+        df["forecast_target"] * (1 + df["dynamic_spread"] * 1.35),
+        df["forecast_target"] * (1 + df["dynamic_spread"]),
+    )
+    df["forecast_conservative"] = np.where(
+        df["prob_overforecast"] > df["prob_underforecast"],
+        df["forecast_target"] * (1 - df["dynamic_spread"] * 1.35),
+        df["forecast_target"] * (1 - df["dynamic_spread"]),
+    )
+    df["forecast_conservative"] = np.maximum(0, df["forecast_conservative"])
+
+    # Stable-version diagnostics only. These do not change forecast values.
+    df["forecast_vs_recent_90_pct"] = df["forecast_target"] / np.maximum(df["recent_90_sales"], 1.0) - 1.0
+    df["forecast_vs_p90_rolling_90_pct"] = df["forecast_target"] / np.maximum(df["p90_rolling_90_sales"], 1.0) - 1.0
+    df["amz_cycle_abs_adjustment_pct"] = np.abs(df["amz_cycle_adjustment_pct"])
+    df["extreme_forecast_flag"] = np.select(
+        [
+            df["forecast_target"] > np.maximum(df["p90_rolling_90_sales"] * 1.50, df["recent_90_sales"] * 1.75),
+            df["forecast_target"] < df["recent_90_sales"] * 0.45,
+            df["amz_cycle_abs_adjustment_pct"] >= 0.08,
+        ],
+        [
+            "REVIEW_HIGH_FORECAST",
+            "REVIEW_LOW_FORECAST",
+            "REVIEW_AMZ_CYCLE_IMPACT",
+        ],
+        default="OK",
+    )
+    return df
+
+
+# ==========================================
+# WEEKLY SEASONAL FORECAST SHAPE
+# ==========================================
+def build_future_week_windows():
+    """
+    Build sequential forecast weeks from FORECAST_START_DATE to FORECAST_END_DATE.
+    The last week may be shorter than 7 days.
+    """
+    start = pd.to_datetime(FORECAST_START_DATE).normalize()
+    end = pd.to_datetime(FORECAST_END_DATE).normalize()
+    windows = []
+    cur = start
+    idx = 1
+    while cur <= end:
+        w_end = min(cur + pd.Timedelta(days=6), end)
+        label = f"aggressive_seasonal_weekly_forecast_w{idx:02d}_{cur.strftime('%Y%m%d')}_to_{w_end.strftime('%Y%m%d')}"
+        windows.append({
+            "week_index": idx,
+            "start": cur,
+            "end": w_end,
+            "label": label,
+            "days": int((w_end - cur).days) + 1,
+        })
+        cur = w_end + pd.Timedelta(days=1)
+        idx += 1
+    return windows
+
+
+def _circular_day_of_year_distance(a, b):
+    """Return circular distance between day-of-year values."""
+    diff = np.abs(np.asarray(a, dtype=float) - float(b))
+    return np.minimum(diff, 366.0 - diff)
+
+
+def calc_weekly_seasonal_weights_for_sku(sku_history, cutoff, week_windows):
+    """
+    Create a SKU-specific weekly seasonal shape.
+
+    This does NOT divide the total forecast evenly.
+    It estimates each future week's relative demand from:
+    - same season / same day-of-year history, using +/- 14 days;
+    - last-year same-period history, using +/- 7 days around the shifted date;
+    - recent 4-week and 12-week run-rate as a trend anchor;
+    - same calendar-month fallback when SKU history is thin.
+
+    The returned weights are normalized to sum to 1, so the existing model's
+    final 3.5-month forecast remains the controlling total quantity.
+    """
+    if sku_history is None or sku_history.empty or not week_windows:
+        days = np.array([w["days"] for w in week_windows], dtype=float)
+        return days / max(days.sum(), 1.0)
+
+    h = sku_history.copy()
+    h = h[h["date"] <= cutoff].copy()
+    if h.empty:
+        days = np.array([w["days"] for w in week_windows], dtype=float)
+        return days / max(days.sum(), 1.0)
+
+    h_daily = h.groupby("date", as_index=False)["sales"].sum()
+    full_dates = pd.date_range(h_daily["date"].min(), cutoff)
+    daily = h_daily.set_index("date")["sales"].reindex(full_dates).fillna(0.0).rename_axis("date").reset_index()
+    daily["day_of_year"] = daily["date"].dt.dayofyear
+    daily["month"] = daily["date"].dt.month
+
+    history_days = max((cutoff - daily["date"].min()).days + 1, 1)
+    total_rate = float(daily["sales"].sum() / history_days)
+    recent_28_rate = float(daily.loc[daily["date"] >= cutoff - pd.Timedelta(days=27), "sales"].sum() / 28.0)
+    recent_84_rate = float(daily.loc[daily["date"] >= cutoff - pd.Timedelta(days=83), "sales"].sum() / 84.0)
+
+    # Recent trend anchors the seasonality, but should not flatten it.
+    if recent_28_rate > 0 or recent_84_rate > 0:
+        recent_anchor = 0.65 * recent_28_rate + 0.35 * recent_84_rate
+    else:
+        recent_anchor = total_rate
+    recent_anchor = max(float(recent_anchor), 0.0001)
+
+    week_scores = []
+    for w in week_windows:
+        score = 0.0
+        future_days = pd.date_range(w["start"], w["end"])
+        for future_dt in future_days:
+            future_doy = int(future_dt.dayofyear)
+            future_month = int(future_dt.month)
+
+            # 1) Same-season / day-of-year pool. Use all available history, but the +/-14 day window
+            # gives higher weeks a chance to show up instead of flattening every future week.
+            doy_dist = _circular_day_of_year_distance(daily["day_of_year"].values, future_doy)
+            season_pool = daily.loc[doy_dist <= 14, "sales"]
+            season_score = float(season_pool.mean()) if len(season_pool) >= 7 else np.nan
+
+            # 2) Last-year same-date pool. This is strongest when it exists.
+            ly_center = future_dt - pd.DateOffset(years=1)
+            ly_pool = daily.loc[
+                (daily["date"] >= ly_center - pd.Timedelta(days=7)) &
+                (daily["date"] <= ly_center + pd.Timedelta(days=7)),
+                "sales"
+            ]
+            ly_score = float(ly_pool.mean()) if len(ly_pool) >= 5 else np.nan
+
+            # 3) Same-month fallback for thin SKU history.
+            month_pool = daily.loc[daily["month"] == future_month, "sales"]
+            month_score = float(month_pool.mean()) if len(month_pool) >= 10 else np.nan
+
+            pieces = []
+            weights = []
+            if not pd.isna(ly_score):
+                pieces.append(ly_score); weights.append(0.45)
+            if not pd.isna(season_score):
+                pieces.append(season_score); weights.append(0.35)
+            if not pd.isna(month_score):
+                pieces.append(month_score); weights.append(0.10)
+
+            # Keep a recent trend anchor so a SKU with a real current acceleration/slowdown
+            # does not blindly copy last year.
+            pieces.append(recent_anchor); weights.append(0.10)
+
+            day_score = float(np.average(pieces, weights=weights)) if pieces else total_rate
+            score += max(day_score, 0.0)
+
+        week_scores.append(score)
+
+    weights = np.asarray(week_scores, dtype=float)
+    if not np.isfinite(weights).all() or weights.sum() <= 0:
+        days = np.array([w["days"] for w in week_windows], dtype=float)
+        weights = days / max(days.sum(), 1.0)
+    else:
+        weights = weights / weights.sum()
+
+    return weights
+
+
+def add_seasonal_weekly_forecast_columns(prod_df, raw_target_non_amz):
+    """
+    Append SKU-level weekly forecasts based on a seasonal weekly shape.
+
+    The weekly numbers are scaled from forecast_aggressive after all model,
+    OOS, AMZ-cycle, customer-layer, and vendor-signal adjustments are applied.
+    This means the seasonal weekly columns sum to the aggressive total, not the target total.
+    """
+    prod_df = prod_df.copy()
+    cutoff = pd.to_datetime(PRODUCTION_CUTOFF).normalize()
+    week_windows = build_future_week_windows()
+    weekly_cols = [w["label"] for w in week_windows]
+
+    if prod_df.empty or not weekly_cols:
+        return prod_df, weekly_cols
+
+    for c in weekly_cols:
+        prod_df[c] = 0.0
+
+    hist = raw_target_non_amz[raw_target_non_amz["date"] <= cutoff].copy()
+    for idx, row in prod_df.iterrows():
+        sku = row["sku_id"]
+        sku_hist = hist[hist["sku_id"] == sku].copy()
+        weights = calc_weekly_seasonal_weights_for_sku(sku_hist, cutoff, week_windows)
+        total_forecast = float(row.get("forecast_aggressive", 0.0) or 0.0)
+        weekly_values = total_forecast * weights
+        for c, v in zip(weekly_cols, weekly_values):
+            prod_df.at[idx, c] = v
+
+    return prod_df, weekly_cols
+
+
+# ==========================================
+# PRODUCTION
+# ==========================================
+def build_production_forecast_table(raw_target_non_amz, raw_signal_all, models_under, models_over, models_reg, train_columns, vendor_forward_features=None, target_skus=None):
+    cutoff = pd.to_datetime(PRODUCTION_CUTOFF)
+    target_until_cutoff = raw_target_non_amz[raw_target_non_amz["date"] <= cutoff].copy()
+    signal_until_cutoff = raw_signal_all[raw_signal_all["date"] <= cutoff].copy()
+    rows = []
+
+    # Keep production output in the exact same order as the provided target list.
+    target_sku_order = target_skus if target_skus is not None else unique_target_skus()
+    available_skus = set(target_until_cutoff["sku_id"].unique())
+
+    for sku in target_sku_order:
+        if sku not in available_skus:
+            continue
+        row, _, _ = build_forecast_row_for_sku(raw_target_non_amz, sku, cutoff, target_until_cutoff, signal_until_cutoff)
+        if row is not None:
+            rows.append(row)
+
+    prod_df = pd.DataFrame(rows)
+    if prod_df.empty:
+        return prod_df
+
+    f_num, f_cat = feature_columns()
+    X_p = pd.get_dummies(prod_df[f_num + f_cat], columns=f_cat, drop_first=False).reindex(columns=train_columns, fill_value=0)
+
+    prod_df["prob_underforecast"] = predict_ensemble(models_under, X_p, mode="proba")
+    prod_df["prob_overforecast"] = predict_ensemble(models_over, X_p, mode="proba")
+    prod_df["pred_target_ratio"] = predict_ensemble(models_reg, X_p, mode="predict")
+
+    prod_df = apply_smart_decision_layer(prod_df)
+
+    # Optional marketplace portal forward-looking AMZ signal.
+    # This is production-only and lightly bounded. If vendor files are missing, default fields are still output.
+    if vendor_forward_features is not None and not vendor_forward_features.empty:
+        prod_df = prod_df.merge(vendor_forward_features, on="sku_id", how="left")
+        prod_df = apply_vendor_forward_signal_layer(prod_df)
+    else:
+        vendor_defaults = load_vendor_forward_features(prod_df["sku_id"].tolist())
+        prod_df = prod_df.merge(vendor_defaults, on="sku_id", how="left")
+        prod_df = apply_vendor_forward_signal_layer(prod_df)
+
+    prod_df["forecast_scope"] = "NON_MARKETPLACE_TARGET_WITH_MARKETPLACE_FORWARD_SIGNAL"
+    prod_df["version_tag"] = VERSION_TAG
+    prod_df["production_cutoff_date"] = str(PRODUCTION_CUTOFF)
+    prod_df["forecast_start_date"] = str(FORECAST_START_DATE)
+    prod_df["forecast_end_date"] = str(FORECAST_END_DATE)
+    prod_df["forecast_horizon_days"] = int(FORECAST_HORIZON_DAYS)
+    prod_df["forecast_months"] = float(FORECAST_MONTHS)
+    prod_df["amz_signal_used"] = np.where(prod_df["amz_present_flag"] == 1, "YES", "NO")
+
+    # Additional manager-facing output columns.
+    # 1) aggressive forecast converted from total 3.5-month forecast into weekly average
+    # 2) past 6-month moving average converted into weekly average
+    forecast_horizon_weeks = max(float(FORECAST_HORIZON_DAYS) / 7.0, 1.0)
+    past_6_month_weeks = 180.0 / 7.0
+    prod_df["aggressive_forecast_weekly_avg"] = prod_df["forecast_aggressive"] / forecast_horizon_weeks
+    prod_df["past_6_month_weekly_moving_avg"] = prod_df["recent_180_sales"] / past_6_month_weeks
+
+    # True weekly forecast outputs: each week receives its own SKU-level seasonal forecast.
+    # These are not a simple average split. They use same-season / last-year / recent-trend shape
+    # and then scale to the final model forecast total.
+    prod_df, seasonal_weekly_forecast_cols = add_seasonal_weekly_forecast_columns(prod_df, raw_target_non_amz)
+
+    out_cols = [
+        "sku_id", "version_tag", "production_cutoff_date", "forecast_start_date", "forecast_end_date", "forecast_horizon_days", "forecast_months",
+        "forecast_scope", "dominant_regime", "selected_model", "main_reason_code", "decision_flag",
+        "forecast_next_90days", "forecast_target", "forecast_conservative", "forecast_aggressive",
+        *seasonal_weekly_forecast_cols,
+        "aggressive_forecast_weekly_avg", "past_6_month_weekly_moving_avg",
+        "forecast_vs_recent_90_pct", "forecast_vs_p90_rolling_90_pct", "extreme_forecast_flag",
+        "confidence_score", "prob_underforecast", "prob_overforecast", "pred_target_ratio",
+        "observed_recent_90_non_amz_sales", "recent_30_sales", "recent_60_sales", "recent_90_sales", "recent_180_sales",
+        "total_recent_30_sales", "total_recent_60_sales", "total_recent_90_sales", "total_recent_180_sales",
+        "amz_recent_30_sales", "amz_recent_60_sales", "amz_recent_90_sales", "amz_recent_180_sales",
+        "amz_share_recent_30", "amz_share_recent_60", "amz_share_recent_90", "amz_share_recent_180",
+        "non_amz_share_recent_180", "amz_momentum_30_90", "amz_days_since_last_order", "amz_spike_count_180", "amz_signal_used",
+        "amz_order_count_all", "amz_order_count_180", "amz_avg_order_size_all", "amz_recent_avg_order_size",
+        "amz_order_size_ratio", "amz_avg_interval_all", "amz_median_interval_all", "amz_recent_median_interval",
+        "amz_interval_ratio", "amz_due_score", "amz_cycle_status", "amz_cycle_signal_strength",
+        "forecast_before_amz_cycle_adjustment", "amz_cycle_adjustment_pct", "amz_cycle_abs_adjustment_pct", "forecast_after_amz_cycle_before_cap",
+        "vendor_signal_status", "vendor_forward_signal_flag", "vendor_forward_adjustment_pct",
+        "forecast_before_vendor_signal_adjustment", "forecast_after_vendor_signal_adjustment",
+        "vendor_amz_signal_reliability", "vendor_amz_bulk_buy_risk_score",
+        "vendor_amz_mean_forecast_horizon", "vendor_amz_mean_forecast_4wk", "vendor_amz_mean_forecast_later",
+        "vendor_amz_forecast_momentum", "vendor_amz_peak_week_forecast", "vendor_amz_forecast_volatility",
+        "vendor_amz_open_po_qty", "vendor_amz_sellable_on_hand_units", "vendor_amz_unfilled_customer_ordered_units",
+        "vendor_amz_sourceable_oos_pct", "vendor_amz_lead_time_days", "vendor_amz_weekly_avg_forecast",
+        "vendor_amz_projected_gap_horizon", "vendor_amz_projected_gap_ratio", "vendor_amz_days_of_supply",
+        "external_amz_share_of_business",
+        "oos_proxy_score", "oos_reconstruction_flag", "imputed_lost_demand_180", "imputed_oos_days_180",
+        "customer_layer_forecast", "customer_layer_ratio", "top3_customer_share_recent_180",
+        "spike_type", "repeatable_spike_score", "recent_zero_sales_days",
+        "p90_rolling_90_sales", "best_score", "model_score_gap"
+    ]
+    out = prod_df[out_cols].copy()
+
+    num_cols = [
+        "forecast_next_90days", "forecast_target", "forecast_conservative", "forecast_aggressive",
+        *seasonal_weekly_forecast_cols,
+        "aggressive_forecast_weekly_avg", "past_6_month_weekly_moving_avg",
+        "observed_recent_90_non_amz_sales", "recent_30_sales", "recent_60_sales", "recent_90_sales", "recent_180_sales",
+        "total_recent_30_sales", "total_recent_60_sales", "total_recent_90_sales", "total_recent_180_sales",
+        "amz_recent_30_sales", "amz_recent_60_sales", "amz_recent_90_sales", "amz_recent_180_sales",
+        "amz_avg_order_size_all", "amz_recent_avg_order_size",
+        "forecast_before_amz_cycle_adjustment", "forecast_after_amz_cycle_before_cap",
+        "forecast_before_vendor_signal_adjustment", "forecast_after_vendor_signal_adjustment",
+        "vendor_amz_mean_forecast_horizon", "vendor_amz_mean_forecast_4wk", "vendor_amz_mean_forecast_later",
+        "vendor_amz_peak_week_forecast", "vendor_amz_open_po_qty", "vendor_amz_sellable_on_hand_units",
+        "vendor_amz_unfilled_customer_ordered_units", "vendor_amz_weekly_avg_forecast",
+        "vendor_amz_projected_gap_horizon", "vendor_amz_days_of_supply",
+        "imputed_lost_demand_180", "customer_layer_forecast"
+    ]
+    out[num_cols] = out[num_cols].round(0)
+    prob_cols = [
+        "confidence_score", "prob_underforecast", "prob_overforecast", "pred_target_ratio", "oos_proxy_score",
+        "customer_layer_ratio", "top3_customer_share_recent_180", "repeatable_spike_score",
+        "best_score", "model_score_gap", "amz_share_recent_30", "amz_share_recent_60",
+        "amz_share_recent_90", "amz_share_recent_180", "non_amz_share_recent_180", "amz_momentum_30_90",
+        "amz_order_size_ratio", "amz_avg_interval_all", "amz_median_interval_all", "amz_recent_median_interval",
+        "amz_interval_ratio", "amz_due_score", "amz_cycle_signal_strength", "amz_cycle_adjustment_pct",
+        "vendor_forward_adjustment_pct", "vendor_amz_signal_reliability", "vendor_amz_bulk_buy_risk_score",
+        "vendor_amz_forecast_momentum", "vendor_amz_forecast_volatility", "vendor_amz_sourceable_oos_pct",
+        "vendor_amz_projected_gap_ratio", "external_amz_share_of_business",
+        "amz_cycle_abs_adjustment_pct", "forecast_vs_recent_90_pct", "forecast_vs_p90_rolling_90_pct"
+    ]
+    out[prob_cols] = out[prob_cols].round(4)
+
+    # Rename production-facing forecast columns so the output is not misleading.
+    # Internal column names still use 90days because the original model code was built around that name,
+    # but the values now use the auto-detected 3.5-month horizon.
+    out = out.rename(columns={
+        "forecast_next_90days": f"baseline_forecast_next_{format_forecast_period_label().lower()}",
+        "forecast_target": f"final_forecast_next_{format_forecast_period_label().lower()}",
+        "forecast_conservative": f"conservative_forecast_next_{format_forecast_period_label().lower()}",
+        "forecast_aggressive": f"aggressive_forecast_next_{format_forecast_period_label().lower()}",
+    })
+
+    # Final CSV order follows the target list order, not alphabetical SKU order.
+    target_sku_order = unique_target_skus()
+    sku_order_map = {sku: i for i, sku in enumerate(target_sku_order)}
+    out["_po_sheet_order"] = out["sku_id"].map(sku_order_map)
+    out = out.sort_values("_po_sheet_order").drop(columns=["_po_sheet_order"]).reset_index(drop=True)
+    return out
+
+
+# ==========================================
+# VALIDATION SUMMARY
+# ==========================================
+def export_validation_summaries(holdout_df):
+    if holdout_df.empty:
+        return
+
+    holdout_df = holdout_df.copy()
+    holdout_df["baseline_abs_error"] = (holdout_df["actual_next_90days"] - holdout_df["forecast_next_90days"]).abs()
+    holdout_df["target_abs_error"] = (holdout_df["actual_next_90days"] - holdout_df["forecast_target"]).abs()
+    holdout_df["error_improvement"] = holdout_df["baseline_abs_error"] - holdout_df["target_abs_error"]
+    holdout_df["baseline_bias"] = holdout_df["forecast_next_90days"] - holdout_df["actual_next_90days"]
+    holdout_df["target_bias"] = holdout_df["forecast_target"] - holdout_df["actual_next_90days"]
+
+    summary_rows = []
+    for sku, g in holdout_df.groupby("sku_id"):
+        summary_rows.append({
+            "sku_id": sku,
+            "n_windows": len(g),
+            "actual_total": g["actual_next_90days"].sum(),
+            "baseline_total": g["forecast_next_90days"].sum(),
+            "target_total": g["forecast_target"].sum(),
+            "baseline_mae": mean_absolute_error(g["actual_next_90days"], g["forecast_next_90days"]),
+            "target_mae": mean_absolute_error(g["actual_next_90days"], g["forecast_target"]),
+            "baseline_wape": wape(g["actual_next_90days"], g["forecast_next_90days"]),
+            "target_wape": wape(g["actual_next_90days"], g["forecast_target"]),
+            "baseline_bias_pct": bias_pct(g["actual_next_90days"], g["forecast_next_90days"]),
+            "target_bias_pct": bias_pct(g["actual_next_90days"], g["forecast_target"]),
+            "improved_windows": int((g["error_improvement"] > 0).sum()),
+            "worse_windows": int((g["error_improvement"] < 0).sum()),
+            "avg_oos_proxy_score": g["oos_proxy_score"].mean(),
+            "avg_imputed_lost_demand_180": g["imputed_lost_demand_180"].mean(),
+            "avg_confidence_score": g["confidence_score"].mean(),
+            "avg_prob_underforecast": g["prob_underforecast"].mean(),
+            "avg_prob_overforecast": g["prob_overforecast"].mean(),
+        })
+
+    sku_summary = pd.DataFrame(summary_rows)
+    sku_summary["target_vs_baseline_wape_delta"] = sku_summary["target_wape"] - sku_summary["baseline_wape"]
+    sku_summary = sku_summary.sort_values("target_vs_baseline_wape_delta")
+    sku_summary.to_csv(SKU_VALIDATION_SUMMARY_OUTPUT_PATH, index=False, encoding="utf-8-sig")
+
+
+
+
+def load_target_skus():
+    """Load target SKUs from a CSV/XLSX file, or fall back to the synthetic demo list."""
+    target_path = Path(str(TARGET_SKU_FILE)) if TARGET_SKU_FILE else None
+    if target_path and target_path.exists():
+        try:
+            if target_path.suffix.lower() in [".xlsx", ".xls"]:
+                target_df = pd.read_excel(target_path)
+            else:
+                target_df = pd.read_csv(target_path)
+
+            if target_df.empty:
+                print(f"Target SKU file is empty. Falling back to SAMPLE_TARGET_SKUS: {target_path}")
+                return unique_target_skus()
+
+            preferred_cols = ["sku_id", "SKU", "sku", "Part_Number", "part_number", "item", "Item"]
+            sku_col = next((c for c in preferred_cols if c in target_df.columns), target_df.columns[0])
+            sku_values = target_df[sku_col].dropna().astype(str).tolist()
+            loaded = unique_target_skus(sku_values)
+            print(f"Loaded {len(loaded)} target SKUs from {target_path}")
+            return loaded
+        except Exception as exc:
+            print(f"Could not read target SKU file [{target_path}]. Falling back to SAMPLE_TARGET_SKUS. Error: {exc}")
+    return unique_target_skus()
+
+
+def apply_cli_args():
+    """Allow local/private runs without editing the script or committing private paths."""
+    global FILE_PATH, TARGET_SKU_FILE, OUTPUT_DIR, USE_VENDOR_FORWARD_SIGNAL
+    global AMZ_MAPPING_FILE_PATTERN, VENDOR_INVENTORY_FILE_PATTERN, VENDOR_FORECAST_FILE_PATTERN
+    global AMZ_SHARE_OF_BUSINESS_FILE_PATTERN
+
+    parser = argparse.ArgumentParser(
+        description="Portfolio-safe inventory demand forecast demo using synthetic or approved input data."
+    )
+    parser.add_argument("--input-file", default=FILE_PATH, help="Sales history CSV path.")
+    parser.add_argument("--target-sku-file", default=TARGET_SKU_FILE, help="Optional CSV/XLSX target SKU list.")
+    parser.add_argument("--output-dir", default=str(OUTPUT_DIR), help="Output folder for forecast CSV.")
+    parser.add_argument("--use-vendor-forward-signal", action="store_true", help="Enable optional marketplace forward-signal files.")
+    parser.add_argument("--marketplace-mapping", default=AMZ_MAPPING_FILE_PATTERN, help="Optional marketplace ASIN/SKU mapping pattern.")
+    parser.add_argument("--marketplace-inventory", default=VENDOR_INVENTORY_FILE_PATTERN, help="Optional marketplace inventory CSV pattern.")
+    parser.add_argument("--marketplace-forecast", default=VENDOR_FORECAST_FILE_PATTERN, help="Optional marketplace forecast CSV pattern.")
+    parser.add_argument("--marketplace-share", default=AMZ_SHARE_OF_BUSINESS_FILE_PATTERN, help="Optional marketplace share workbook pattern.")
+    args = parser.parse_args()
+
+    FILE_PATH = args.input_file
+    TARGET_SKU_FILE = args.target_sku_file
+    OUTPUT_DIR = Path(args.output_dir)
+    USE_VENDOR_FORWARD_SIGNAL = bool(args.use_vendor_forward_signal or USE_VENDOR_FORWARD_SIGNAL)
+    AMZ_MAPPING_FILE_PATTERN = args.marketplace_mapping
+    VENDOR_INVENTORY_FILE_PATTERN = args.marketplace_inventory
+    VENDOR_FORECAST_FILE_PATTERN = args.marketplace_forecast
+    AMZ_SHARE_OF_BUSINESS_FILE_PATTERN = args.marketplace_share
+
+
+# ==========================================
+# MAIN PIPELINE
+# ==========================================
+def run_end_to_end_pipeline():
+    print("1. Loading raw data...")
+    raw = pd.read_csv(FILE_PATH).rename(columns={
+        "Part_Number": "sku_id",
+        "Date": "date",
+        "Quantity": "sales",
+        "Customer": "customer",
+        "Segment": "segment",
+    })
+
+    raw["date"] = pd.to_datetime(raw["date"], errors="coerce")
+    raw["sku_id"] = raw["sku_id"].apply(normalize_sku)
+    raw["sales"] = pd.to_numeric(raw["sales"], errors="coerce").fillna(0)
+    raw["customer"] = raw["customer"].astype(str)
+    if "segment" not in raw.columns:
+        raw["segment"] = "UNKNOWN"
+    raw["segment"] = raw["segment"].astype(str).fillna("UNKNOWN")
+
+    raw = raw[(raw["sales"] > 0) & (raw["date"] >= pd.to_datetime(TRAIN_START_DATE))].copy()
+    if raw.empty:
+        print("No usable rows after basic sales/date filtering. Check input file.")
+        return
+
+    auto_settings = compute_auto_forecast_settings(raw["date"])
+    print("Auto forecast settings:")
+    for k, v in auto_settings.items():
+        print(f"  {k}: {v}")
+
+    target_skus = load_target_skus()
+    print("Target SKU count:", len(target_skus))
+    raw = raw[
+        (raw["date"] <= pd.to_datetime(PRODUCTION_CUTOFF)) &
+        (raw["sku_id"].isin(target_skus))
+    ].copy()
+    raw = raw.sort_values(["sku_id", "date", "customer"]).reset_index(drop=True)
+
+    if raw.empty:
+        print("No usable target-SKU rows after filtering. Check input file and SKU list.")
+        return
+
+    raw_all, raw_amz, raw_non_amz = split_amz_non_amz(raw)
+    raw_all = raw_all.sort_values(["sku_id", "date", "customer"]).reset_index(drop=True)
+    raw_amz = raw_amz.sort_values(["sku_id", "date", "customer"]).reset_index(drop=True)
+    raw_non_amz = raw_non_amz.sort_values(["sku_id", "date", "customer"]).reset_index(drop=True)
+
+    print("Forecast mode: non-marketplace target with marketplace/all-sales signal + marketplace cycle interval features.")
+    print("Stable output: one production CSV with diagnostic flags only.")
+    print("Total rows after date/SKU filter:", len(raw_all))
+    print("Total sales after date/SKU filter:", float(raw_all["sales"].sum()))
+    print("marketplace rows included as signal:", len(raw_amz))
+    print("marketplace sales included as signal:", float(raw_amz["sales"].sum()))
+    print("Non-marketplace sales used as target:", float(raw_non_amz["sales"].sum()))
+
+    print("Loading optional marketplace portal forward-signal files...")
+    vendor_forward_features = load_vendor_forward_features(target_skus)
+    available_vendor_skus = int((vendor_forward_features["vendor_signal_status"] == "VENDOR_SIGNAL_AVAILABLE").sum()) if not vendor_forward_features.empty else 0
+    print("marketplace portal signal SKUs available:", available_vendor_skus)
+
+    if raw_non_amz.empty:
+        print("No non-marketplace rows available. Cannot build a non-marketplace target forecast.")
+        return
+
+    print("2. Building single training dataset: features include marketplace signal; target is non-marketplace future auto-horizon sales...")
+    df = build_uplift_training_data(raw_non_amz, raw_all)
+    if df.empty:
+        print("Training data is empty. Check date range, horizon, and non-marketplace SKU history.")
+        return
+
+    df = df.sort_values(["sku_id", "cutoff_date"]).reset_index(drop=True)
+    train_df = df[df["cutoff_date"] < pd.to_datetime(UPLIFT_HOLDOUT_START)].copy()
+    holdout_df = df[df["cutoff_date"] >= pd.to_datetime(UPLIFT_HOLDOUT_START)].copy()
+    train_df = train_df.sort_values(["sku_id", "cutoff_date"]).reset_index(drop=True)
+    holdout_df = holdout_df.sort_values(["sku_id", "cutoff_date"]).reset_index(drop=True)
+
+    if train_df.empty:
+        print("Train split is empty. Move UPLIFT_HOLDOUT_START later or check data range.")
+        return
+
+    print(f"3. Training one ML correction layer for {VERSION_TAG}...")
+    f_num, f_cat = feature_columns()
+    X_train = pd.get_dummies(train_df[f_num + f_cat], columns=f_cat, drop_first=False)
+    X_train = X_train.reindex(sorted(X_train.columns), axis=1)
+
+    y_under = train_df["is_underforecast_risk"]
+    y_over = train_df["is_overforecast_risk"]
+    y_reg = train_df["target_ratio"]
+
+    models_under = [
+        RandomForestClassifier(n_estimators=80, max_depth=6, class_weight="balanced", random_state=42, n_jobs=-1),
+        ExtraTreesClassifier(n_estimators=80, max_depth=6, class_weight="balanced", random_state=42, n_jobs=-1),
+        HistGradientBoostingClassifier(max_iter=70, max_depth=5, class_weight="balanced", random_state=42),
+    ]
+    for m in models_under:
+        m.fit(X_train, y_under)
+
+    models_over = [
+        RandomForestClassifier(n_estimators=80, max_depth=6, class_weight="balanced", random_state=43, n_jobs=-1),
+        ExtraTreesClassifier(n_estimators=80, max_depth=6, class_weight="balanced", random_state=43, n_jobs=-1),
+        HistGradientBoostingClassifier(max_iter=70, max_depth=5, class_weight="balanced", random_state=43),
+    ]
+    for m in models_over:
+        m.fit(X_train, y_over)
+
+    models_reg = [
+        RandomForestRegressor(n_estimators=80, max_depth=5, random_state=44, n_jobs=-1),
+        HistGradientBoostingRegressor(loss="squared_error", max_iter=70, max_depth=4, random_state=44),
+    ]
+    for m in models_reg:
+        m.fit(X_train, y_reg)
+
+    if not holdout_df.empty:
+        print("4. Holdout check against non-marketplace actuals...")
+        X_holdout = pd.get_dummies(holdout_df[f_num + f_cat], columns=f_cat, drop_first=False).reindex(columns=X_train.columns, fill_value=0)
+        holdout_df["prob_underforecast"] = predict_ensemble(models_under, X_holdout, mode="proba")
+        holdout_df["prob_overforecast"] = predict_ensemble(models_over, X_holdout, mode="proba")
+        holdout_df["pred_target_ratio"] = predict_ensemble(models_reg, X_holdout, mode="predict")
+        holdout_df = apply_smart_decision_layer(holdout_df)
+
+        baseline_mae = mean_absolute_error(holdout_df["actual_next_90days"], holdout_df["forecast_next_90days"])
+        target_mae = mean_absolute_error(holdout_df["actual_next_90days"], holdout_df["forecast_target"])
+        baseline_wape = wape(holdout_df["actual_next_90days"], holdout_df["forecast_next_90days"])
+        target_wape = wape(holdout_df["actual_next_90days"], holdout_df["forecast_target"])
+        baseline_bias = bias_pct(holdout_df["actual_next_90days"], holdout_df["forecast_next_90days"])
+        target_bias = bias_pct(holdout_df["actual_next_90days"], holdout_df["forecast_target"])
+        print(f"MAE:  Baseline {baseline_mae:.2f} | Final Target {target_mae:.2f}")
+        print(f"WAPE: Baseline {baseline_wape:.2%} | Final Target {target_wape:.2%}")
+        print(f"Bias: Baseline {baseline_bias:.2%} | Final Target {target_bias:.2%}")
+
+    print("5. Building final non-marketplace production forecast with AMZ cycle signal...")
+    prod_df = build_production_forecast_table(raw_non_amz, raw_all, models_under, models_over, models_reg, X_train.columns, vendor_forward_features, target_skus=target_skus)
+    if not prod_df.empty:
+        produced_skus = set(prod_df["sku_id"].astype(str))
+        missing_target_skus = [sku for sku in target_skus if sku not in produced_skus]
+        if missing_target_skus:
+            print("WARNING - target SKUs still missing from production output:", ", ".join(missing_target_skus))
+        else:
+            print("All target SKUs with usable non-marketplace history are present in production output.")
+
+        prod_df.to_csv(PRODUCTION_OUTPUT_PATH, index=False, encoding="utf-8-sig")
+        print("Final production forecast exported:")
+        print(PRODUCTION_OUTPUT_PATH)
+    else:
+        print("Production output is empty after filtering.")
+
+
+if __name__ == "__main__":
+    apply_cli_args()
+    run_end_to_end_pipeline()
